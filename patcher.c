@@ -119,14 +119,14 @@ static unsigned char* ReadWholeFile(const char* path, size_t* outSize)
         NULL);
     if (file == INVALID_HANDLE_VALUE)
     {
-        UiLog("[!] Unable to open '%s'. Please check that the file exists and is accessible.", path);
+        UiLog(Tr(STR_LOG_ERR_OPEN_FILE), path);
         return NULL;
     }
 
     if (!GetFileSizeEx(file, &fileSize) || fileSize.QuadPart <= 0 ||
         fileSize.QuadPart > (LONGLONG)0x7FFFFFFF)
     {
-        UiLog("[!] The file '%s' has an invalid size.", path);
+        UiLog(Tr(STR_LOG_ERR_INVALID_SIZE), path);
         CloseHandle(file);
         return NULL;
     }
@@ -134,7 +134,7 @@ static unsigned char* ReadWholeFile(const char* path, size_t* outSize)
     buffer = (unsigned char*)malloc((size_t)fileSize.QuadPart);
     if (!buffer)
     {
-        UiLog("[!] Not enough memory to read '%s'.", path);
+        UiLog(Tr(STR_LOG_ERR_NOT_ENOUGH_MEM), path);
         CloseHandle(file);
         return NULL;
     }
@@ -146,7 +146,7 @@ static unsigned char* ReadWholeFile(const char* path, size_t* outSize)
         if (!ReadFile(file, buffer + readTotal, toRead - readTotal, &chunk, NULL) ||
             chunk == 0)
         {
-            UiLog("[!] Could not read '%s'.", path);
+            UiLog(Tr(STR_LOG_ERR_READ_FILE), path);
             free(buffer);
             CloseHandle(file);
             return NULL;
@@ -175,7 +175,7 @@ static BOOL WriteWholeFile(const char* path, const unsigned char* data, size_t s
         NULL);
     if (file == INVALID_HANDLE_VALUE)
     {
-        UiLog("[!] Unable to save changes to '%s'. Please ensure the app is running as Administrator.", path);
+        UiLog(Tr(STR_LOG_ERR_SAVE_CHANGES_ADMIN), path);
         return FALSE;
     }
 
@@ -184,7 +184,7 @@ static BOOL WriteWholeFile(const char* path, const unsigned char* data, size_t s
         DWORD chunk = (size - total > 0x10000000) ? 0x10000000 : (DWORD)(size - total);
         if (!WriteFile(file, data + total, chunk, &written, NULL))
         {
-            UiLog("[!] Could not write to '%s'. Please check available disk space and permissions.", path);
+            UiLog(Tr(STR_LOG_ERR_WRITE_FILE), path);
             CloseHandle(file);
             return FALSE;
         }
@@ -222,34 +222,34 @@ static BOOL ParsePe(unsigned char* base, size_t size, PE_VIEW* view)
 
     if (size < sizeof(IMAGE_DOS_HEADER))
     {
-        UiLog("[!] The selected file is too small to be a valid executable.");
+        UiLog("%s", Tr(STR_LOG_ERR_FILE_TOO_SMALL));
         return FALSE;
     }
 
     dos = (IMAGE_DOS_HEADER*)base;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE)
     {
-        UiLog("[!] The selected file is not a valid Windows executable.");
+        UiLog("%s", Tr(STR_LOG_ERR_NOT_VALID_PE));
         return FALSE;
     }
 
     if ((size_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > size)
     {
-        UiLog("[!] The executable file header is invalid.");
+        UiLog("%s", Tr(STR_LOG_ERR_PE_HEADER_INVALID));
         return FALSE;
     }
 
     nt = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE)
     {
-        UiLog("[!] The selected file is not a valid Windows executable.");
+        UiLog("%s", Tr(STR_LOG_ERR_NOT_VALID_PE));
         return FALSE;
     }
 
     if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
         nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
     {
-        UiLog("[!] Only 64-bit (x64) versions of Cloudflare WARP are supported.");
+        UiLog("%s", Tr(STR_LOG_ERR_X64_ONLY));
         return FALSE;
     }
 
@@ -836,7 +836,7 @@ BOOL StopWarpService(BOOL* outWasRunning)
     scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
     if (!scm)
     {
-        UiLog("[!] Could not connect to Windows Service Manager. Please run as Administrator.");
+        UiLog("%s", Tr(STR_LOG_ERR_SCM_ADMIN));
         return FALSE;
     }
 
@@ -850,13 +850,13 @@ BOOL StopWarpService(BOOL* outWasRunning)
         {
             return TRUE;   /* not installed: nothing to control */
         }
-        UiLog("[!] Could not access Cloudflare WARP service.");
+        UiLog("%s", Tr(STR_LOG_ERR_ACCESS_SERVICE));
         return FALSE;
     }
 
     if (!QueryServiceStatus(svc, &status))
     {
-        UiLog("[!] Could not check service status.");
+        UiLog("%s", Tr(STR_LOG_ERR_CHECK_SERVICE_STATUS));
         CloseServiceHandle(svc);
         CloseServiceHandle(scm);
         return FALSE;
@@ -874,12 +874,12 @@ BOOL StopWarpService(BOOL* outWasRunning)
         *outWasRunning = TRUE;
     }
 
-    UiLog("Stop service...");
+    UiLog("%s", Tr(STR_LOG_STOP_SERVICE));
     if (status.dwCurrentState != SERVICE_STOP_PENDING)
     {
         if (!ControlService(svc, SERVICE_CONTROL_STOP, &status))
         {
-            UiLog("[!] Could not stop Cloudflare WARP service.");
+            UiLog("%s", Tr(STR_LOG_ERR_STOP_SERVICE));
             CloseServiceHandle(svc);
             CloseServiceHandle(scm);
             return FALSE;
@@ -902,7 +902,7 @@ BOOL StopWarpService(BOOL* outWasRunning)
 
     if (status.dwCurrentState != SERVICE_STOPPED)
     {
-        UiLog("[!] Cloudflare WARP service took too long to stop.");
+        UiLog("%s", Tr(STR_LOG_ERR_STOP_TIMEOUT));
         return FALSE;
     }
 
@@ -920,7 +920,7 @@ BOOL StartWarpService(void)
     scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
     if (!scm)
     {
-        UiLog("[!] Could not connect to Windows Service Manager. Please run as Administrator.");
+        UiLog("%s", Tr(STR_LOG_ERR_SCM_ADMIN));
         return FALSE;
     }
 
@@ -928,18 +928,18 @@ BOOL StartWarpService(void)
                        SERVICE_QUERY_STATUS | SERVICE_START);
     if (!svc)
     {
-        UiLog("[!] Could not open Cloudflare WARP service to start it.");
+        UiLog("%s", Tr(STR_LOG_ERR_OPEN_SERVICE_START));
         CloseServiceHandle(scm);
         return FALSE;
     }
 
-    UiLog("Start service...");
+    UiLog("%s", Tr(STR_LOG_START_SERVICE));
     if (!StartServiceA(svc, 0, NULL))
     {
         DWORD err = GetLastError();
         if (err != ERROR_SERVICE_ALREADY_RUNNING)
         {
-            UiLog("[!] Could not start Cloudflare WARP service.");
+            UiLog("%s", Tr(STR_LOG_ERR_START_SERVICE));
             CloseServiceHandle(svc);
             CloseServiceHandle(scm);
             return FALSE;
@@ -967,7 +967,7 @@ BOOL StartWarpService(void)
 
     if (status.dwCurrentState != SERVICE_RUNNING)
     {
-        UiLog("[!] Cloudflare WARP service took too long to start.");
+        UiLog("%s", Tr(STR_LOG_ERR_START_TIMEOUT));
         return FALSE;
     }
 
@@ -1030,14 +1030,14 @@ BOOL RemoveSideloadedUserenv(const char* target)
         return TRUE;   /* clean: no sideloaded DLL present */
     }
 
-    UiLog("Cleaning up leftover userenv.dll.");
+    UiLog("%s", Tr(STR_LOG_CLEANING_USERENV));
     if (!DeleteFileA(dll))
     {
-        UiLog("[!] Could not remove leftover '%s'.", dll);
+        UiLog(Tr(STR_LOG_ERR_DELETE_USERENV), dll);
         return FALSE;
     }
 
-    UiLog("Cleaned up leftover userenv.dll.");
+    UiLog("%s", Tr(STR_LOG_CLEANED_USERENV));
     return TRUE;
 }
 
@@ -1229,7 +1229,7 @@ BOOL WarpDisconnectIfConnected(const char* target, BOOL* outWasConnected)
         *outWasConnected = TRUE;
     }
 
-    UiLog("Disconnecting...");
+    UiLog("%s", Tr(STR_LOG_DISCONNECTING));
     _snprintf(cmd, sizeof(cmd), "\"%s\" disconnect", cli);
     cmd[sizeof(cmd) - 1] = '\0';
 
@@ -1260,7 +1260,7 @@ BOOL WarpConnect(const char* target)
 
     if (!RunAndCapture(cmd, NULL, output, sizeof(output), &exitCode))
     {
-        UiLog("Note: You can reconnect the tunnel using the Cloudflare WARP app.");
+        UiLog("%s", Tr(STR_LOG_RECONNECT_NOTE));
         return FALSE;
     }
 
@@ -1278,7 +1278,7 @@ BOOL RunRestore(const char* target)
 
     if (!FileExists(backup))
     {
-        UiLog("[!] No backup file found. There is nothing to restore.");
+        UiLog("%s", Tr(STR_LOG_ERR_NO_BACKUP));
         return FALSE;
     }
 
@@ -1301,8 +1301,8 @@ BOOL RunRestore(const char* target)
             free(cur);
             if (targetSize != size)
             {
-                UiLog("[!] The backup file is from a different version of Cloudflare WARP.");
-                UiLog("    The current warp-svc.exe is already an original unpatched version.");
+                UiLog("%s", Tr(STR_LOG_ERR_BACKUP_DIFF_VER));
+                UiLog("%s", Tr(STR_LOG_ERR_CURRENT_UNPATCHED));
                 free(data);
                 return FALSE;
             }
@@ -1317,7 +1317,7 @@ BOOL RunRestore(const char* target)
 
     free(data);
     DeleteFileA(backup);
-    UiLog("Original file restored from backup.");
+    UiLog("%s", Tr(STR_LOG_RESTORED_OK));
     return TRUE;
 }
 
@@ -1432,35 +1432,35 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
     minMasqueLen = MinTargetLength(g_MasqueHostnames, MASQUE_HOSTNAME_COUNT);
     if (newLen == 0)
     {
-        UiLog("[!] MASQUE SNI cannot be empty. Please enter a hostname (e.g. %s).", DEFAULT_SNI);
+        UiLog(Tr(STR_LOG_ERR_EMPTY_SNI), DEFAULT_SNI);
         return FALSE;
     }
     if (newLen > minMasqueLen)
     {
-        UiLog("[!] The MASQUE SNI '%s' is too long (%zu characters; maximum allowed is %zu).",
+        UiLog(Tr(STR_LOG_ERR_SNI_TOO_LONG),
               newSni, newLen, minMasqueLen);
-        UiLog("    Tip: The default '%s' is recommended.", DEFAULT_SNI);
+        UiLog(Tr(STR_LOG_TIP_DEFAULT_SNI), DEFAULT_SNI);
         return FALSE;
     }
 
     regLenPlain = strlen(newRegSni);
     if (regLenPlain == 0)
     {
-        UiLog("[!] Registration API hostname cannot be empty. Please enter a hostname (e.g. %s).", DEFAULT_REG_SNI);
+        UiLog(Tr(STR_LOG_ERR_EMPTY_REG_SNI), DEFAULT_REG_SNI);
         return FALSE;
     }
     if (regLenPlain > sizeof(regDotted) - 2)
     {
-        UiLog("[!] The registration hostname is too long (maximum %zu characters).",
+        UiLog(Tr(STR_LOG_ERR_REG_SNI_TOO_LONG),
               sizeof(regDotted) - 2);
-        UiLog("    Tip: The default '%s' is recommended.", DEFAULT_REG_SNI);
+        UiLog(Tr(STR_LOG_TIP_DEFAULT_REG_SNI), DEFAULT_REG_SNI);
         return FALSE;
     }
 
     if (!FileExists(target))
     {
-        UiLog("[!] Could not find warp-svc.exe at: %s", target);
-        UiLog("    Please verify the installation path.");
+        UiLog(Tr(STR_LOG_ERR_FIND_WARP_SVC), target);
+        UiLog("%s", Tr(STR_LOG_ERR_VERIFY_PATH));
         return FALSE;
     }
 
@@ -1511,7 +1511,7 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
             view = targetView;
             masqueCount = tMasque;
             regCount = tReg;
-            UiLog("Backup...");
+            UiLog("%s", Tr(STR_LOG_BACKUP));
         }
         else
         {
@@ -1520,8 +1520,8 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
 
             if (!FileExists(backup))
             {
-                UiLog("[!] Could not find original hostnames in warp-svc.exe and no backup exists.");
-                UiLog("    The file may already be patched, or this version of WARP is not supported.");
+                UiLog("%s", Tr(STR_LOG_ERR_NO_ORIG_HOSTS_AND_NO_BACKUP));
+                UiLog("%s", Tr(STR_LOG_ERR_ALREADY_PATCHED_OR_UNSUPPORTED));
                 return FALSE;
             }
 
@@ -1533,8 +1533,8 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
 
             if (sourceSize != targetSize)
             {
-                UiLog("[!] The backup file is from a different version of Cloudflare WARP.");
-                UiLog("    Please delete '%s' and re-run against a fresh installation.", backup);
+                UiLog("%s", Tr(STR_LOG_ERR_BACKUP_DIFF_VER));
+                UiLog(Tr(STR_LOG_ERR_DELETE_BACKUP_FRESH), backup);
                 free(source);
                 return FALSE;
             }
@@ -1554,8 +1554,8 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
             if (CountTargets(masqueOccs, masqueCount) == 0 ||
                 CountTargets(regOccs, regCount) == 0)
             {
-                UiLog("[!] Could not find original hostnames in the backup file.");
-                UiLog("    This version of Cloudflare WARP may not be supported.");
+                UiLog("%s", Tr(STR_LOG_ERR_BACKUP_NO_ORIG_HOSTS));
+                UiLog("%s", Tr(STR_LOG_ERR_BACKUP_UNSUPPORTED));
                 free(source);
                 return FALSE;
             }
@@ -1592,9 +1592,9 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
     }
     else
     {
-        UiLog("[!] Registration hostname '%s' is too long (%zu characters; maximum is %zu).",
+        UiLog(Tr(STR_LOG_ERR_REG_HOSTNAME_TOO_LONG),
               newRegSni, regLenPlain, regCap);
-        UiLog("    Tip: The default '%s' is recommended.", DEFAULT_REG_SNI);
+        UiLog(Tr(STR_LOG_TIP_DEFAULT_REG_SNI), DEFAULT_REG_SNI);
         free(source);
         return FALSE;
     }
@@ -1634,8 +1634,8 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
     }
     if (regLenChanged && soaPatched == 0)
     {
-        UiLog("[!] Could not safely update registration hostname in this version of WARP.");
-        UiLog("    Tip: The default '%s' is recommended.", DEFAULT_REG_SNI);
+        UiLog("%s", Tr(STR_LOG_ERR_REG_UPDATE_UNSAFE));
+        UiLog(Tr(STR_LOG_TIP_DEFAULT_REG_SNI), DEFAULT_REG_SNI);
         free(source);
         return FALSE;
     }
@@ -1734,7 +1734,7 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
             }
         }
 
-        UiLog("Patching...");
+        UiLog("%s", Tr(STR_LOG_PATCHING));
         /* UiLog("MASQUE SNI:");
         if (uniqueMasqueCount > 0)
         {

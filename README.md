@@ -12,3 +12,15 @@ The patcher parses `warp-svc.exe` as a PE image, and for each known hostname it:
 MASQUE hostnames are packed string-table literals, so the replacement must fit the original length; the tail is left untouched (Rust `&str` is `(ptr, len)` with no NUL terminator, so the patched length bounds every read). Registration hosts sit in fixed 32-byte slots, so the replacement may be longer, up to the slot capacity.
 
 The original binary is preserved as `<target>.bak`, refreshed whenever the target is still pristine, so re-running after a WARP update stays clean. Patching breaks the Authenticode signature.
+
+## Releases
+
+Pre-built release packages (`.zip`) are available on the [Releases](https://github.com/Sketchystan1/warp-sni-patcher/releases) page. See [CHANGELOG.md](CHANGELOG.md) for details on each release.
+
+## Building from source
+
+Requires Visual Studio with C++ desktop development tools (MSVC x64). Run:
+
+```cmd
+build.bat
+```

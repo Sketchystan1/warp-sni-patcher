@@ -13,6 +13,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include "i18n.h"
 
 /* Embedded application icon (see app.rc). Lowest ID so Explorer uses it. */
 #define IDI_APPICON 1

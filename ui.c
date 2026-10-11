@@ -34,14 +34,19 @@
 #define IDC_RESTORE_BTN  1003
 #define IDC_PATCH_BTN    1004
 #define IDC_LOG_EDIT     1005
+#define IDC_LANG_BTN     1006
+#define IDM_LANG_EN      2001
+#define IDM_LANG_RU      2002
 
 /* Layout constants (client-relative pixels). */
 #define UI_MARGIN               16
 #define UI_ROW_H                26
 #define UI_BTN_H                30
+#define UI_LANG_BTN_W           56
+#define UI_LANG_BTN_H           24
 #define UI_MIN_WIDTH            460
-#define UI_COMPACT_CLIENT_H     228
-#define UI_EXPANDED_CLIENT_H    380
+#define UI_COMPACT_CLIENT_H     252
+#define UI_EXPANDED_CLIENT_H    396
 
 static HWND g_hMainWindow = NULL;
 static HWND g_hLog = NULL;      /* multiline log edit control */
@@ -56,8 +61,10 @@ static HWND g_hRegSniLabel = NULL;
 static HWND g_hRegSniEdit = NULL;
 static HWND g_hRestoreBtn = NULL;
 static HWND g_hPatchBtn = NULL;
+static HWND g_hLangBtn = NULL;
 static HWND g_hLogLabel = NULL;
 static BOOL g_logVisible = FALSE;
+static BOOL g_isPatched = FALSE;
 
 static DWORD g_mainThreadId = 0;
 static HANDLE g_hWorkerThread = NULL;
@@ -87,8 +94,10 @@ typedef enum {
 } PreferredAppMode;
 typedef PreferredAppMode (WINAPI *SetPreferredAppMode_t)(PreferredAppMode);
 typedef BOOL (WINAPI *AllowDarkModeForWindow_t)(HWND, BOOL);
+typedef void (WINAPI *FlushMenuThemes_t)(void);
 
 static AllowDarkModeForWindow_t p_AllowDarkModeForWindow = NULL;
+static FlushMenuThemes_t p_FlushMenuThemes = NULL;
 static BOOL g_darkMode = FALSE;
 static HBRUSH g_hWndBrush = NULL;   /* DARK_BG */
 static HBRUSH g_hCtlBrush = NULL;   /* DARK_CTLBG */
@@ -125,6 +134,8 @@ static void InitDarkModeSupport(void)
             GetProcAddress(hUx, MAKEINTRESOURCEA(135));
         p_AllowDarkModeForWindow = (AllowDarkModeForWindow_t)
             GetProcAddress(hUx, MAKEINTRESOURCEA(133));
+        p_FlushMenuThemes = (FlushMenuThemes_t)
+            GetProcAddress(hUx, MAKEINTRESOURCEA(136));
         if (pSet)
         {
             pSet(APPMODE_ALLOWDARK);
@@ -146,6 +157,10 @@ static void ApplyAppTheme(HWND hwnd)
     {
         p_AllowDarkModeForWindow(hwnd, dark);
     }
+    if (p_FlushMenuThemes)
+    {
+        p_FlushMenuThemes();
+    }
     DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
                           &value, sizeof(value));
 
@@ -160,20 +175,21 @@ static void ApplyAppTheme(HWND hwnd)
         SetWindowTheme(g_hLog, exp, NULL);
         SetWindowTheme(g_hRestoreBtn, exp, NULL);
         SetWindowTheme(g_hPatchBtn, exp, NULL);
+        SetWindowTheme(g_hLangBtn, exp, NULL);
     }
 
     InvalidateRect(hwnd, NULL, TRUE);
 }
 
 /* Create a font by face name and point size (negative height = point size). */
-static HFONT MakeFont(const char* face, int pointSize, int weight)
+static HFONT MakeFont(const wchar_t* face, int pointSize, int weight)
 {
     HDC hdc = GetDC(NULL);
     int height = -MulDiv(pointSize, GetDeviceCaps(hdc, LOGPIXELSY), 72);
     HFONT font;
     ReleaseDC(NULL, hdc);
 
-    font = CreateFontA(
+    font = CreateFontW(
         height, 0, 0, 0, weight, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
@@ -182,29 +198,100 @@ static HFONT MakeFont(const char* face, int pointSize, int weight)
 
 static void LayoutControls(HWND hwnd);
 
-/* Expand the window to show the log box when patching/restoring starts. */
-static void EnsureLogVisible(HWND hwnd)
+static int MeasureHintHeight(HWND hwnd, int hintW)
 {
-    if (g_logVisible || !hwnd)
+    int hintH = 48;
+    if (g_hHintLabel && g_hUiFont && hintW > 0)
+    {
+        int textLen = GetWindowTextLengthW(g_hHintLabel);
+        if (textLen > 0)
+        {
+            wchar_t* text = (wchar_t*)malloc((textLen + 1) * sizeof(wchar_t));
+            if (text)
+            {
+                GetWindowTextW(g_hHintLabel, text, textLen + 1);
+                HDC hdc = GetDC(hwnd);
+                if (hdc)
+                {
+                    HFONT oldFont = (HFONT)SelectObject(hdc, g_hUiFont);
+                    RECT rcText = { 0, 0, hintW, 0 };
+                    DrawTextW(hdc, text, -1, &rcText, DT_CALCRECT | DT_WORDBREAK);
+                    SelectObject(hdc, oldFont);
+                    ReleaseDC(hwnd, hdc);
+                    int calcH = (rcText.bottom - rcText.top) + 2;
+                    if (calcH > 28)
+                    {
+                        hintH = calcH;
+                    }
+                }
+                free(text);
+            }
+        }
+    }
+    return hintH;
+}
+
+static int GetCompactContentHeight(HWND hwnd, int hintW)
+{
+    int hintH = MeasureHintHeight(hwnd, hintW);
+    int m = UI_MARGIN;
+    int belowHint = 10 + 22 + UI_ROW_H + 12 + 22 + UI_ROW_H + 16 + UI_BTN_H + m;
+    return m + hintH + belowHint;
+}
+
+/* Automatically resize window to fit current content vertically. */
+static void AutoResizeToFitContent(HWND hwnd)
+{
+    if (!hwnd || IsIconic(hwnd) || IsZoomed(hwnd))
     {
         return;
     }
 
-    g_logVisible = TRUE;
-
-    RECT rcWin, rcClient;
-    GetWindowRect(hwnd, &rcWin);
+    RECT rcClient, rcWin;
     GetClientRect(hwnd, &rcClient);
+    GetWindowRect(hwnd, &rcWin);
+
+    int cw = rcClient.right - rcClient.left;
+    if (cw <= 0)
+    {
+        cw = 500;
+    }
+
+    int fieldW = cw - UI_MARGIN * 2;
+    int hintW = fieldW - UI_LANG_BTN_W - 8;
+    if (hintW < 80)
+    {
+        hintW = 80;
+    }
+
+    int compactH = GetCompactContentHeight(hwnd, hintW);
+    int targetClientH;
+
+    if (g_logVisible)
+    {
+        int curClientH = rcClient.bottom - rcClient.top;
+        int logTop = compactH + 22;
+        int curLogH = curClientH - logTop - UI_MARGIN;
+        int minLogH = 140;
+        int logH = (curLogH > minLogH) ? curLogH : minLogH;
+        targetClientH = logTop + logH + UI_MARGIN;
+    }
+    else
+    {
+        targetClientH = compactH;
+    }
 
     int curClientH = rcClient.bottom - rcClient.top;
-    int targetClientH = UI_EXPANDED_CLIENT_H;
     int diffH = targetClientH - curClientH;
-    if (diffH > 0)
+
+    if (diffH != 0)
     {
         int newWinH = (rcWin.bottom - rcWin.top) + diffH;
+        int newWinW = rcWin.right - rcWin.left;
         int newTop = rcWin.top;
+
         RECT work;
-        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0))
+        if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0))
         {
             if (newTop + newWinH > work.bottom)
             {
@@ -215,10 +302,22 @@ static void EnsureLogVisible(HWND hwnd)
                 }
             }
         }
-        SetWindowPos(hwnd, NULL, rcWin.left, newTop,
-                     rcWin.right - rcWin.left, newWinH,
+
+        SetWindowPos(hwnd, NULL, rcWin.left, newTop, newWinW, newWinH,
                      SWP_NOZORDER | SWP_NOACTIVATE);
     }
+}
+
+/* Expand the window to show the log box when patching/restoring starts. */
+static void EnsureLogVisible(HWND hwnd)
+{
+    if (g_logVisible || !hwnd)
+    {
+        return;
+    }
+
+    g_logVisible = TRUE;
+    AutoResizeToFitContent(hwnd);
 
     if (g_hLogLabel) ShowWindow(g_hLogLabel, SW_SHOW);
     if (g_hLog) ShowWindow(g_hLog, SW_SHOW);
@@ -234,12 +333,22 @@ static void AppendLogText(const char* line)
         EnsureLogVisible(g_hMainWindow);
     }
 
-    if (g_hLog)
+    if (g_hLog && line)
     {
-        int len = GetWindowTextLengthA(g_hLog);
-        SendMessageA(g_hLog, EM_SETSEL, (WPARAM)len, (LPARAM)len);
-        SendMessageA(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)line);
-        SendMessageA(g_hLog, EM_SCROLLCARET, 0, 0);
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, line, -1, NULL, 0);
+        if (wlen > 0)
+        {
+            wchar_t* wline = (wchar_t*)malloc(wlen * sizeof(wchar_t));
+            if (wline)
+            {
+                MultiByteToWideChar(CP_UTF8, 0, line, -1, wline, wlen);
+                int len = GetWindowTextLengthW(g_hLog);
+                SendMessageW(g_hLog, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+                SendMessageW(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)wline);
+                SendMessageW(g_hLog, EM_SCROLLCARET, 0, 0);
+                free(wline);
+            }
+        }
     }
 }
 
@@ -272,7 +381,7 @@ void UiLog(const char* fmt, ...)
             char* copy = _strdup(line);
             if (copy)
             {
-                if (!PostMessageA(g_hMainWindow, WM_APP_LOG, 0, (LPARAM)copy))
+                if (!PostMessageW(g_hMainWindow, WM_APP_LOG, 0, (LPARAM)copy))
                 {
                     free(copy);
                 }
@@ -339,7 +448,7 @@ static void SetUiBusy(BOOL busy, BOOL isRestore)
         EnableWindow(g_hPatchBtn, !busy);
         if (busy && !isRestore)
         {
-            SetWindowTextA(g_hPatchBtn, "Patching...");
+            SetWindowTextW(g_hPatchBtn, TrW(STR_STATUS_PATCHING));
         }
     }
     if (g_hRestoreBtn)
@@ -347,7 +456,7 @@ static void SetUiBusy(BOOL busy, BOOL isRestore)
         EnableWindow(g_hRestoreBtn, !busy);
         if (busy && isRestore)
         {
-            SetWindowTextA(g_hRestoreBtn, "Restoring...");
+            SetWindowTextW(g_hRestoreBtn, TrW(STR_STATUS_RESTORING));
         }
     }
     if (g_hSniEdit)
@@ -357,6 +466,10 @@ static void SetUiBusy(BOOL busy, BOOL isRestore)
     if (g_hRegSniEdit)
     {
         EnableWindow(g_hRegSniEdit, !busy);
+    }
+    if (g_hLangBtn)
+    {
+        EnableWindow(g_hLangBtn, !busy);
     }
 }
 
@@ -373,7 +486,7 @@ static DWORD WINAPI PatchWorkerThread(LPVOID lpParam)
 
         if (!StopWarpService(&wasRunning))
         {
-            UiLog("[!] Could not stop Cloudflare WARP service. Please ensure the app is running as Administrator.");
+            UiLog("%s", Tr(STR_LOG_ERR_STOP_SERVICE_ADMIN));
             goto finish;
         }
 
@@ -385,11 +498,11 @@ static DWORD WINAPI PatchWorkerThread(LPVOID lpParam)
 
         if (success)
         {
-            UiLog("Done!");
+            UiLog("%s", Tr(STR_LOG_DONE));
         }
         else
         {
-            UiLog("[!] Patch could not be applied. Your original files were left unchanged.");
+            UiLog("%s", Tr(STR_LOG_ERR_PATCH_FAILED));
         }
     }
     else
@@ -398,7 +511,7 @@ static DWORD WINAPI PatchWorkerThread(LPVOID lpParam)
 
         if (!StopWarpService(&wasRunning))
         {
-            UiLog("[!] Could not stop Cloudflare WARP service. Please ensure the app is running as Administrator.");
+            UiLog("%s", Tr(STR_LOG_ERR_STOP_SERVICE_ADMIN));
             goto finish;
         }
 
@@ -408,16 +521,16 @@ static DWORD WINAPI PatchWorkerThread(LPVOID lpParam)
 
         if (success)
         {
-            UiLog("Done!");
+            UiLog("%s", Tr(STR_LOG_DONE));
         }
         else
         {
-            UiLog("[!] Restore could not be completed. Please check that a .bak backup file exists.");
+            UiLog("%s", Tr(STR_LOG_ERR_RESTORE_FAILED));
         }
     }
 
 finish:
-    PostMessageA(g_hMainWindow, WM_APP_WORKER_DONE, (WPARAM)p->isRestore, (LPARAM)success);
+    PostMessageW(g_hMainWindow, WM_APP_WORKER_DONE, (WPARAM)p->isRestore, (LPARAM)success);
     free(p);
     return 0;
 }
@@ -437,7 +550,7 @@ static void OnPatchClicked(HWND hwnd)
     EnsureLogVisible(hwnd);
     if (g_hLog)
     {
-        SetWindowTextA(g_hLog, "");
+        SetWindowTextW(g_hLog, L"");
     }
 
     GetEditText(hwnd, IDC_SNI_EDIT, sni, sizeof(sni));
@@ -447,16 +560,16 @@ static void OnPatchClicked(HWND hwnd)
 
     if (!FileExists(target))
     {
-        UiLog("[!] Cloudflare WARP service executable not found at:");
+        UiLog("%s", Tr(STR_LOG_ERR_TARGET_NOT_FOUND));
         UiLog("    %s", target);
-        UiLog("    Please make sure Cloudflare WARP is installed.");
+        UiLog("%s", Tr(STR_LOG_ERR_CHECK_INSTALL));
         return;
     }
 
     p = (WORKER_PARAMS*)malloc(sizeof(WORKER_PARAMS));
     if (!p)
     {
-        UiLog("[!] Memory allocation failed.");
+        UiLog("%s", Tr(STR_LOG_ERR_MEM_ALLOC));
         return;
     }
 
@@ -473,7 +586,7 @@ static void OnPatchClicked(HWND hwnd)
     g_hWorkerThread = CreateThread(NULL, 0, PatchWorkerThread, p, 0, NULL);
     if (!g_hWorkerThread)
     {
-        UiLog("[!] Failed to create background thread.");
+        UiLog("%s", Tr(STR_LOG_ERR_THREAD_CREATE));
         SetUiBusy(FALSE, FALSE);
         free(p);
     }
@@ -493,13 +606,13 @@ static void OnRestoreClicked(HWND hwnd)
     EnsureLogVisible(hwnd);
     if (g_hLog)
     {
-        SetWindowTextA(g_hLog, "");
+        SetWindowTextW(g_hLog, L"");
     }
 
     BuildBackupPath(target, backup, sizeof(backup));
     if (!FileExists(backup))
     {
-        UiLog("[!] No backup file found. There is nothing to restore.");
+        UiLog("%s", Tr(STR_LOG_ERR_NO_BACKUP));
         UpdateRestoreButton(hwnd);
         return;
     }
@@ -507,7 +620,7 @@ static void OnRestoreClicked(HWND hwnd)
     p = (WORKER_PARAMS*)malloc(sizeof(WORKER_PARAMS));
     if (!p)
     {
-        UiLog("[!] Memory allocation failed.");
+        UiLog("%s", Tr(STR_LOG_ERR_MEM_ALLOC));
         return;
     }
 
@@ -522,18 +635,18 @@ static void OnRestoreClicked(HWND hwnd)
     g_hWorkerThread = CreateThread(NULL, 0, PatchWorkerThread, p, 0, NULL);
     if (!g_hWorkerThread)
     {
-        UiLog("[!] Failed to create background thread.");
+        UiLog("%s", Tr(STR_LOG_ERR_THREAD_CREATE));
         SetUiBusy(FALSE, TRUE);
         free(p);
     }
 }
 
-static HWND CreateLabel(HWND parent, const char* text, int x, int y, int w, int h)
+static HWND CreateLabel(HWND parent, const wchar_t* text, int x, int y, int w, int h)
 {
-    HWND label = CreateWindowExA(
-        0, "STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT,
+    HWND label = CreateWindowExW(
+        0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT,
         x, y, w, h, parent, NULL, NULL, NULL);
-    SendMessageA(label, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+    SendMessageW(label, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
     return label;
 }
 
@@ -545,9 +658,12 @@ static void LayoutControls(HWND hwnd)
     RECT rc;
     int m = UI_MARGIN;
     int cw, fieldW, y, logTop;
-    const int browseW = 88;
-    const int btnW = 120;
+    const int btnW = 130;
     const int gap = 8;
+    const int langBtnW = UI_LANG_BTN_W;
+    const int langBtnH = UI_LANG_BTN_H;
+    int hintH;
+    int hintW;
 
     GetClientRect(hwnd, &rc);
     cw = rc.right - rc.left;
@@ -556,10 +672,20 @@ static void LayoutControls(HWND hwnd)
     {
         fieldW = 120;
     }
+    hintW = fieldW - langBtnW - 8;
+    if (hintW < 80)
+    {
+        hintW = 80;
+    }
+    hintH = MeasureHintHeight(hwnd, hintW);
     y = m;
 
-    MoveWindow(g_hHintLabel, m, y, fieldW, 32, TRUE);
-    y += 32 + 10;
+    MoveWindow(g_hHintLabel, m, y, hintW, hintH, TRUE);
+    if (g_hLangBtn)
+    {
+        MoveWindow(g_hLangBtn, m + fieldW - langBtnW, y, langBtnW, langBtnH, TRUE);
+    }
+    y += hintH + 10;
 
     MoveWindow(g_hSniLabel, m, y, fieldW, 18, TRUE);
     y += 22;
@@ -591,53 +717,96 @@ static void LayoutControls(HWND hwnd)
     }
 }
 
+static void UpdateUiLanguage(HWND hwnd)
+{
+    SetWindowTextW(hwnd, TrW(STR_APP_TITLE));
+    if (g_hHintLabel)
+    {
+        SetWindowTextW(g_hHintLabel, TrW(STR_TIP_HINT));
+    }
+    if (g_hSniLabel)
+    {
+        SetWindowTextW(g_hSniLabel, TrW(STR_MASQUE_SNI_LABEL));
+    }
+    if (g_hRegSniLabel)
+    {
+        SetWindowTextW(g_hRegSniLabel, TrW(STR_REG_SNI_LABEL));
+    }
+    if (g_hRestoreBtn)
+    {
+        SetWindowTextW(g_hRestoreBtn, TrW(STR_RESTORE_BTN));
+    }
+    if (g_hPatchBtn)
+    {
+        SetWindowTextW(g_hPatchBtn, g_isPatched ? TrW(STR_STATUS_PATCHED) : TrW(STR_PATCH_BTN));
+    }
+    if (g_hLogLabel)
+    {
+        SetWindowTextW(g_hLogLabel, TrW(STR_LOG_LABEL));
+    }
+    if (g_hLangBtn)
+    {
+        SetWindowTextW(g_hLangBtn, I18nIsRussian() ? L"РУ \x25BE" : L"EN \x25BE");
+    }
+
+    AutoResizeToFitContent(hwnd);
+    LayoutControls(hwnd);
+    InvalidateRect(hwnd, NULL, TRUE);
+}
+
 static void CreateControls(HWND hwnd)
 {
     /* Fonts: Segoe UI for the UI, Consolas for the log. */
-    g_hUiFont = MakeFont("Segoe UI", 10, FW_NORMAL);
-    g_hMonoFont = MakeFont("Consolas", 10, FW_NORMAL);
+    g_hUiFont = MakeFont(L"Segoe UI", 10, FW_NORMAL);
+    g_hMonoFont = MakeFont(L"Consolas", 10, FW_NORMAL);
 
     g_hHintLabel = CreateLabel(
         hwnd,
-        "Tip: Replaces blocked WARP hostnames to restore connection.\r\nPre-filled hosts are recommended. Just click Patch.",
+        TrW(STR_TIP_HINT),
         0, 0, 10, 32);
 
-    g_hSniLabel = CreateLabel(hwnd, "New MASQUE SNI hostname", 0, 0, 10, 18);
-    g_hSniEdit = CreateWindowExA(
-        0, "EDIT", DEFAULT_SNI,
+    g_hLangBtn = CreateWindowExW(
+        0, L"BUTTON", I18nIsRussian() ? L"РУ \x25BE" : L"EN \x25BE",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        0, 0, UI_LANG_BTN_W, UI_LANG_BTN_H, hwnd, (HMENU)(INT_PTR)IDC_LANG_BTN, NULL, NULL);
+    SendMessageW(g_hLangBtn, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+
+    g_hSniLabel = CreateLabel(hwnd, TrW(STR_MASQUE_SNI_LABEL), 0, 0, 10, 18);
+    g_hSniEdit = CreateWindowExW(
+        0, L"EDIT", L"" DEFAULT_SNI,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
         0, 0, 10, UI_ROW_H, hwnd, (HMENU)(INT_PTR)IDC_SNI_EDIT, NULL, NULL);
-    SendMessageA(g_hSniEdit, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+    SendMessageW(g_hSniEdit, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
 
     g_hRegSniLabel = CreateLabel(
-        hwnd, "New registration API hostname", 0, 0, 10, 18);
-    g_hRegSniEdit = CreateWindowExA(
-        0, "EDIT", DEFAULT_REG_SNI,
+        hwnd, TrW(STR_REG_SNI_LABEL), 0, 0, 10, 18);
+    g_hRegSniEdit = CreateWindowExW(
+        0, L"EDIT", L"" DEFAULT_REG_SNI,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
         0, 0, 10, UI_ROW_H, hwnd, (HMENU)(INT_PTR)IDC_REGSNI_EDIT, NULL, NULL);
-    SendMessageA(g_hRegSniEdit, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+    SendMessageW(g_hRegSniEdit, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
 
-    g_hRestoreBtn = CreateWindowExA(
-        0, "BUTTON", "Restore",
+    g_hRestoreBtn = CreateWindowExW(
+        0, L"BUTTON", TrW(STR_RESTORE_BTN),
         WS_CHILD | WS_TABSTOP,
         0, 0, 10, UI_BTN_H, hwnd, (HMENU)(INT_PTR)IDC_RESTORE_BTN, NULL, NULL);
-    SendMessageA(g_hRestoreBtn, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
-    g_hPatchBtn = CreateWindowExA(
-        0, "BUTTON", "Patch",
+    SendMessageW(g_hRestoreBtn, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+    g_hPatchBtn = CreateWindowExW(
+        0, L"BUTTON", TrW(STR_PATCH_BTN),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
         0, 0, 10, UI_BTN_H, hwnd, (HMENU)(INT_PTR)IDC_PATCH_BTN, NULL, NULL);
-    SendMessageA(g_hPatchBtn, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+    SendMessageW(g_hPatchBtn, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
 
-    g_hLogLabel = CreateWindowExA(
-        0, "STATIC", "Log", WS_CHILD | SS_LEFT,
+    g_hLogLabel = CreateWindowExW(
+        0, L"STATIC", TrW(STR_LOG_LABEL), WS_CHILD | SS_LEFT,
         0, 0, 10, 18, hwnd, NULL, NULL, NULL);
-    SendMessageA(g_hLogLabel, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+    SendMessageW(g_hLogLabel, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
 
-    g_hLog = CreateWindowExA(
-        0, "EDIT", "",
+    g_hLog = CreateWindowExW(
+        0, L"EDIT", L"",
         WS_CHILD | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
         0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)IDC_LOG_EDIT, NULL, NULL);
-    SendMessageA(g_hLog, WM_SETFONT, (WPARAM)g_hMonoFont, TRUE);
+    SendMessageW(g_hLog, WM_SETFONT, (WPARAM)g_hMonoFont, TRUE);
 
     LayoutControls(hwnd);
     UpdateRestoreButton(hwnd);
@@ -651,6 +820,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_hMainWindow = hwnd;
         g_mainThreadId = GetCurrentThreadId();
         CreateControls(hwnd);
+        AutoResizeToFitContent(hwnd);
         ApplyAppTheme(hwnd);
         return 0;
 
@@ -680,20 +850,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         if (!isRestore)
         {
+            g_isPatched = success;
             if (g_hPatchBtn)
             {
-                SetWindowTextA(g_hPatchBtn, success ? "Patched" : "Patch");
+                SetWindowTextW(g_hPatchBtn, success ? TrW(STR_STATUS_PATCHED) : TrW(STR_PATCH_BTN));
             }
         }
         else
         {
+            g_isPatched = FALSE;
             if (g_hRestoreBtn)
             {
-                SetWindowTextA(g_hRestoreBtn, "Restore");
+                SetWindowTextW(g_hRestoreBtn, TrW(STR_RESTORE_BTN));
             }
             if (g_hPatchBtn)
             {
-                SetWindowTextA(g_hPatchBtn, "Patch");
+                SetWindowTextW(g_hPatchBtn, TrW(STR_PATCH_BTN));
             }
         }
         UpdateRestoreButton(hwnd);
@@ -726,11 +898,43 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case IDC_RESTORE_BTN:
             OnRestoreClicked(hwnd);
             return 0;
+        case IDC_LANG_BTN:
+            if (g_hWorkerThread == NULL && g_hLangBtn)
+            {
+                RECT rc;
+                GetWindowRect(g_hLangBtn, &rc);
+                HMENU hMenu = CreatePopupMenu();
+                if (hMenu)
+                {
+                    AppendMenuW(hMenu, MF_STRING | (!I18nIsRussian() ? MF_CHECKED : 0),
+                                IDM_LANG_EN, L"EN");
+                    AppendMenuW(hMenu, MF_STRING | (I18nIsRussian() ? MF_CHECKED : 0),
+                                IDM_LANG_RU, L"РУ");
+
+                    int cmd = TrackPopupMenuEx(hMenu,
+                        TPM_RIGHTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON | TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                        rc.right, rc.bottom, hwnd, NULL);
+                    DestroyMenu(hMenu);
+
+                    if (cmd == IDM_LANG_EN && I18nIsRussian())
+                    {
+                        I18nSetRussian(FALSE);
+                        UpdateUiLanguage(hwnd);
+                    }
+                    else if (cmd == IDM_LANG_RU && !I18nIsRussian())
+                    {
+                        I18nSetRussian(TRUE);
+                        UpdateUiLanguage(hwnd);
+                    }
+                }
+            }
+            return 0;
         case IDC_SNI_EDIT:
         case IDC_REGSNI_EDIT:
             if (HIWORD(wParam) == EN_CHANGE && g_hPatchBtn && g_hWorkerThread == NULL)
             {
-                SetWindowTextA(g_hPatchBtn, "Patch");
+                g_isPatched = FALSE;
+                SetWindowTextW(g_hPatchBtn, TrW(STR_PATCH_BTN));
             }
             return 0;
         }
@@ -739,9 +943,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_CLOSE:
         if (g_hWorkerThread != NULL)
         {
-            MessageBoxA(hwnd,
-                "An operation is currently in progress. Please wait until it completes before closing.",
-                "WARP SNI Patcher", MB_ICONWARNING | MB_OK);
+            MessageBoxW(hwnd,
+                TrW(STR_MSG_OP_IN_PROGRESS),
+                TrW(STR_APP_TITLE), MB_ICONWARNING | MB_OK);
             return 0;
         }
         DestroyWindow(hwnd);
@@ -785,7 +989,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     /* The system light/dark setting changed: re-apply live. */
     case WM_SETTINGCHANGE:
-        if (lParam && lstrcmpiA((const char*)lParam, "ImmersiveColorSet") == 0)
+        if (lParam && (_wcsicmp((const wchar_t*)lParam, L"ImmersiveColorSet") == 0 ||
+                       _stricmp((const char*)lParam, "ImmersiveColorSet") == 0))
         {
             ApplyAppTheme(hwnd);
         }
@@ -794,12 +999,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_GETMINMAXINFO:
     {
         MINMAXINFO* mmi = (MINMAXINFO*)lParam;
-        RECT rc = { 0, 0, UI_MIN_WIDTH, g_logVisible ? 345 : UI_COMPACT_CLIENT_H };
-        AdjustWindowRect(&rc, (DWORD)GetWindowLongPtrA(hwnd, GWL_STYLE), FALSE);
+        int cw = UI_MIN_WIDTH;
+        if (hwnd)
+        {
+            RECT rcClient;
+            if (GetClientRect(hwnd, &rcClient) && (rcClient.right - rcClient.left) > UI_MIN_WIDTH)
+            {
+                cw = rcClient.right - rcClient.left;
+            }
+        }
+        int fieldW = cw - UI_MARGIN * 2;
+        int hintW = fieldW - UI_LANG_BTN_W - 8;
+        if (hintW < 80) hintW = 80;
+        int compactH = GetCompactContentHeight(hwnd, hintW);
+        int minClientH = g_logVisible ? (compactH + 22 + 80) : compactH;
+
+        RECT rc = { 0, 0, UI_MIN_WIDTH, minClientH };
+        AdjustWindowRect(&rc, (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE), FALSE);
         mmi->ptMinTrackSize.x = rc.right - rc.left;
         mmi->ptMinTrackSize.y = rc.bottom - rc.top;
         return 0;
     }
+
+    case WM_EXITSIZEMOVE:
+        if (!g_logVisible)
+        {
+            AutoResizeToFitContent(hwnd);
+        }
+        return 0;
 
     case WM_DESTROY:
         if (g_hWorkerThread)
@@ -832,19 +1059,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
-    return DefWindowProcA(hwnd, msg, wParam, lParam);
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
 {
-    WNDCLASSEXA wc;
+    WNDCLASSEXW wc;
     HWND hwnd;
     MSG msg;
-    const char* className = "WarpSniPatcherWindow";
+    const wchar_t* className = L"WarpSniPatcherWindow";
 
     (void)hPrevInstance;
-    (void)lpCmdLine;
+
+    I18nInit(lpCmdLine);
 
     g_mainThreadId = GetCurrentThreadId();
 
@@ -865,21 +1093,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = className;
-    wc.hIcon = LoadIconA(hInstance, MAKEINTRESOURCEA(IDI_APPICON));
-    wc.hIconSm = LoadIconA(hInstance, MAKEINTRESOURCEA(IDI_APPICON));
+    wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPICON));
+    wc.hIconSm = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPICON));
 
-    if (!RegisterClassExA(&wc))
+    if (!RegisterClassExW(&wc))
     {
-        MessageBoxA(NULL, "Failed to register window class.", "WARP SNI Patcher", MB_ICONERROR);
+        MessageBoxW(NULL, TrW(STR_ERR_REGISTER_CLASS), TrW(STR_APP_TITLE), MB_ICONERROR);
         return 1;
     }
 
     {
-        /* Size the window compactly on initial launch. */
-        DWORD style = WS_OVERLAPPEDWINDOW;
+        /* Fixed-size window (non-resizable); layout auto-fits content programmatically. */
+        DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         RECT rc = { 0, 0, 500, UI_COMPACT_CLIENT_H };
         int winW, winH, x, y;
         RECT work;
@@ -892,7 +1120,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
            deliberately: for a process's first top-level window it derives the
            position from the launch STARTUPINFO, and elevated launches often
            pass (0,0) -- which parks the window in the top-left corner. */
-        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0))
+        if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0))
         {
             x = work.left + ((work.right - work.left) - winW) / 2;
             y = work.top + ((work.bottom - work.top) - winH) / 2;
@@ -903,15 +1131,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             y = CW_USEDEFAULT;
         }
 
-        hwnd = CreateWindowExA(
-            0, className, "WARP SNI Patcher", style,
+        hwnd = CreateWindowExW(
+            0, className, TrW(STR_APP_TITLE), style,
             x, y, winW, winH,
             NULL, NULL, hInstance, NULL);
     }
     if (!hwnd)
     {
-        MessageBoxA(NULL, "Failed to create window.", "WARP SNI Patcher", MB_ICONERROR);
+        MessageBoxW(NULL, TrW(STR_ERR_CREATE_WINDOW), TrW(STR_APP_TITLE), MB_ICONERROR);
         return 1;
+    }
+
+    {
+        RECT rcWin, work;
+        if (GetWindowRect(hwnd, &rcWin) && SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0))
+        {
+            int w = rcWin.right - rcWin.left;
+            int h = rcWin.bottom - rcWin.top;
+            int cx = work.left + ((work.right - work.left) - w) / 2;
+            int cy = work.top + ((work.bottom - work.top) - h) / 2;
+            SetWindowPos(hwnd, NULL, cx, cy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
     }
 
     /* Allow lower-integrity processes (such as build scripts) to send WM_CLOSE through UIPI. */
@@ -920,12 +1160,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
-    while (GetMessageA(&msg, NULL, 0, 0) > 0)
+    while (GetMessageW(&msg, NULL, 0, 0) > 0)
     {
-        if (!IsDialogMessageA(hwnd, &msg))
+        if (!IsDialogMessageW(hwnd, &msg))
         {
             TranslateMessage(&msg);
-            DispatchMessage(&msg);
+            DispatchMessageW(&msg);
         }
     }
 

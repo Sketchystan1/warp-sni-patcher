@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ master, main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & Verify
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build warp-sni-patcher
+        shell: cmd
+        run: |
+          build.bat -nopause
+
+      - name: Verify build artifact
+        shell: pwsh
+        run: |
+          $exePath = "warp-sni-patcher.exe"
+          if (-not (Test-Path $exePath)) {
+              Write-Error "Expected build artifact '$exePath' was not found!"
+              exit 1
+          }
+          $file = Get-Item $exePath
+          Write-Host "Build verified successfully: $($file.FullName) ($($file.Length) bytes)"
+          if ($file.Length -lt 10000) {
+              Write-Error "Generated executable is suspiciously small ($($file.Length) bytes)."
+              exit 1
+          }
