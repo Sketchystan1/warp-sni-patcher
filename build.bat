@@ -18,6 +18,19 @@ if not exist %VCVARS% (
     goto :error
 )
 
+:: Auto-close warp-sni-patcher.exe if currently running so the binary is not locked.
+tasklist /FI "IMAGENAME eq warp-sni-patcher.exe" 2>nul | findstr /I /C:"warp-sni-patcher.exe" >nul
+if not errorlevel 1 (
+    echo %YELLOW%Closing running instance of warp-sni-patcher.exe...%RESET%
+    taskkill /F /IM warp-sni-patcher.exe >nul 2>&1
+    tasklist /FI "IMAGENAME eq warp-sni-patcher.exe" 2>nul | findstr /I /C:"warp-sni-patcher.exe" >nul
+    if not errorlevel 1 (
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-Process warp-sni-patcher -ErrorAction SilentlyContinue; if ($p) { $p.CloseMainWindow() | Out-Null; Start-Sleep -Milliseconds 400 }; if (Get-Process warp-sni-patcher -ErrorAction SilentlyContinue) { Start-Process taskkill -ArgumentList '/F /IM warp-sni-patcher.exe' -Verb RunAs -Wait -WindowStyle Hidden }" >nul 2>&1
+    )
+    timeout /t 1 /nobreak >nul 2>&1
+)
+(call )
+
 echo %YELLOW%Building patcher...%RESET%
 call %VCVARS% amd64 >nul 2>&1
 pushd "%PATCHER_DIR%"
@@ -43,8 +56,11 @@ if errorlevel 1 goto :error
 
 del /Q "%PATCHER_DIR%*.obj" "%PATCHER_DIR%*.exp" "%PATCHER_DIR%*.lib" "%PATCHER_DIR%*.res" 2>nul
 
-echo %GREEN%[+] Patcher built: %PATCHER_EXE%%RESET%
+echo %GREEN%[+] Patcher built: .\warp-sni-patcher.exe%RESET%
 popd
+echo.
+echo Press any key to close . . .
+pause >nul
 endlocal
 exit /b 0
 

@@ -1,30 +1,37 @@
 /*
  * WARP SNI Patcher -- core (PE parsing, in-place patching, service control).
  *
- * Standalone on-disk binary patcher for Cloudflare WARP's warp-svc.exe. It
- * overrides the MASQUE SNI hostname(s) baked into the binary.
+ * Standalone on-disk patcher for Cloudflare WARP's warp-svc.exe. It overrides
+ * two groups of hostnames baked into the binary:
+ *   1. MASQUE tunnel SNI hostnames (consumer-masque / zt-masque ...).
+ *   2. The registration API endpoint hostname (api.cloudflareclient.com), the
+ *      SNI used for the client-registration HTTPS API.
  *
- * Strategy (in-place overwrite):
- *   For each known MASQUE hostname found in the binary's data sections, the
- *   string bytes are overwritten in place with the new SNI. Because the string
- *   keeps its original address, no Rust &'static str fat-pointer or LEA
- *   repointing is required -- only the length values need fixing:
- *     1. Fat-pointer length fields in data ([8-byte ptr][8-byte len]) whose ptr
- *        matches the hostname's preferred VA.
- *     2. `mov r32, imm32` length immediates in code, but only within a small
- *        window around a `lea reg,[rip+disp]` that targets a matched hostname,
- *        so unrelated constants elsewhere are never touched.
+ * Each string is overwritten in place, keeping its original address so no Rust
+ * &'static str fat-pointer or LEA needs repointing -- only the lengths:
+ *   1. Fat-pointer length fields in data ([ptr][len]) whose ptr matches.
+ *   2. `mov r32, imm32` length immediates in code, only within a small window
+ *      around a `lea reg,[rip+disp]` that targets the matched hostname.
+ *   3. Registration hosts only: a parallel ptr/len array (next to the string
+ *      "ConsumerEndpointConfig") that code indexes at runtime.
  *
- * The original binary is preserved as <target>.bak. The backup is refreshed
- * whenever the target still contains the MASQUE hostnames (a pristine install
- * or a fresh WARP update), so re-running with a different SNI stays clean and a
- * WARP update never leaves a stale backup behind.
+ * MASQUE hostnames live in the packed Rust string table, so a replacement must
+ * be no longer than the original and the old tail is left in place. The
+ * registration hosts live in fixed 32-byte zero-padded slots
+ * ([slot][0xFF..FF marker][ptr][len]), so a replacement may be LONGER (up to
+ * the measured slot capacity) with the leftover zeroed. Every API host is
+ * stored as an FQDN with a trailing dot, so one is appended when it fits.
+ *
+ * The original is preserved as <target>.bak, refreshed whenever the target
+ * still contains ALL known hostnames (pristine install or fresh WARP update),
+ * so re-running stays clean and an update never leaves a stale backup.
  *
  * NOTE: patching breaks warp-svc.exe's Authenticode signature, and WARP updates
  * replace the binary, so the patcher must be re-run after each update.
  */
 
 #include "patcher.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,18 +46,39 @@ typedef struct KNOWN_SNI_TAG
 {
     const char* value;
     size_t length;
+    BOOL patchTarget;   /* TRUE: replace this string; FALSE: anchor only */
 } KNOWN_SNI;
 
-static const KNOWN_SNI g_KnownHostnames[] = {
-    { "consumer-masque.cloudflareclient.com", 36 },
-    { "consumer-masque.cloudflareclient.com.", 37 },
-    { "consumer-masque-proxy.cloudflareclient.com", 42 },
-    { "consumer-masque-proxy.cloudflareclient.com.", 43 },
-    { "zt-masque.cloudflareclient.com", 30 },
-    { "zt-masque.cloudflareclient.com.", 31 },
-    { "zt-masque-proxy.cloudflareclient.com", 36 },
-    { "zt-masque-proxy.cloudflareclient.com.", 37 }
+/* MASQUE tunnel hostnames: packed string-table literals, so a replacement must
+   fit the original length and the tail is left intact (see OverwriteHostname). */
+static const KNOWN_SNI g_MasqueHostnames[] = {
+    { "consumer-masque.cloudflareclient.com", 36, TRUE },
+    { "consumer-masque.cloudflareclient.com.", 37, TRUE },
+    { "consumer-masque-proxy.cloudflareclient.com", 42, TRUE },
+    { "consumer-masque-proxy.cloudflareclient.com.", 43, TRUE },
+    { "zt-masque.cloudflareclient.com", 30, TRUE },
+    { "zt-masque.cloudflareclient.com.", 31, TRUE },
+    { "zt-masque-proxy.cloudflareclient.com", 36, TRUE },
+    { "zt-masque-proxy.cloudflareclient.com.", 37, TRUE }
 };
+
+/* Registration API hosts: trailing-dot FQDNs in fixed 32-byte slots, so a
+   replacement may grow up to the slot capacity. Only the consumer endpoint is
+   a patch target; the devices/federal anchors let PatchSoaLengths find and
+   verify the parallel ptr/len arrays first. Undotted forms are accepted too. */
+static const KNOWN_SNI g_RegHostnames[] = {
+    { "api.cloudflareclient.com.", 25, TRUE },
+    { "api.cloudflareclient.com", 24, TRUE },
+    { "api.devices.cloudflare.com.", 27, FALSE },
+    { "api.devices.cloudflare.com", 26, FALSE },
+    { "api.devices.fed.cloudflare.com.", 31, FALSE },
+    { "api.devices.fed.cloudflare.com", 30, FALSE }
+};
+
+#define MASQUE_HOSTNAME_COUNT \
+    (sizeof(g_MasqueHostnames) / sizeof(g_MasqueHostnames[0]))
+#define REG_HOSTNAME_COUNT \
+    (sizeof(g_RegHostnames) / sizeof(g_RegHostnames[0]))
 
 /* A located hostname occurrence in the on-disk image. */
 typedef struct OCCURRENCE_TAG
@@ -58,6 +86,9 @@ typedef struct OCCURRENCE_TAG
     size_t fileOffset;      /* byte offset within the file buffer */
     ULONGLONG virtualAddr;  /* preferred VA = ImageBase + RVA */
     size_t originalLength;  /* length of the matched hostname */
+    const KNOWN_SNI* known; /* table entry that matched here */
+    BOOL slotConfirmed;     /* fixed-slot storage layout verified */
+    size_t slotCapacity;    /* usable bytes at fileOffset when confirmed */
 } OCCURRENCE;
 
 typedef struct PE_VIEW_TAG
@@ -88,14 +119,14 @@ static unsigned char* ReadWholeFile(const char* path, size_t* outSize)
         NULL);
     if (file == INVALID_HANDLE_VALUE)
     {
-        UiLog("[!] Cannot open '%s' (error %lu).", path, GetLastError());
+        UiLog("[!] Unable to open '%s'. Please check that the file exists and is accessible.", path);
         return NULL;
     }
 
     if (!GetFileSizeEx(file, &fileSize) || fileSize.QuadPart <= 0 ||
         fileSize.QuadPart > (LONGLONG)0x7FFFFFFF)
     {
-        UiLog("[!] Unexpected file size for '%s'.", path);
+        UiLog("[!] The file '%s' has an invalid size.", path);
         CloseHandle(file);
         return NULL;
     }
@@ -103,7 +134,7 @@ static unsigned char* ReadWholeFile(const char* path, size_t* outSize)
     buffer = (unsigned char*)malloc((size_t)fileSize.QuadPart);
     if (!buffer)
     {
-        UiLog("[!] Out of memory reading '%s'.", path);
+        UiLog("[!] Not enough memory to read '%s'.", path);
         CloseHandle(file);
         return NULL;
     }
@@ -115,7 +146,7 @@ static unsigned char* ReadWholeFile(const char* path, size_t* outSize)
         if (!ReadFile(file, buffer + readTotal, toRead - readTotal, &chunk, NULL) ||
             chunk == 0)
         {
-            UiLog("[!] Read error on '%s' (error %lu).", path, GetLastError());
+            UiLog("[!] Could not read '%s'.", path);
             free(buffer);
             CloseHandle(file);
             return NULL;
@@ -144,8 +175,7 @@ static BOOL WriteWholeFile(const char* path, const unsigned char* data, size_t s
         NULL);
     if (file == INVALID_HANDLE_VALUE)
     {
-        UiLog("[!] Cannot write '%s' (error %lu). Run as Administrator?",
-              path, GetLastError());
+        UiLog("[!] Unable to save changes to '%s'. Please ensure the app is running as Administrator.", path);
         return FALSE;
     }
 
@@ -154,7 +184,7 @@ static BOOL WriteWholeFile(const char* path, const unsigned char* data, size_t s
         DWORD chunk = (size - total > 0x10000000) ? 0x10000000 : (DWORD)(size - total);
         if (!WriteFile(file, data + total, chunk, &written, NULL))
         {
-            UiLog("[!] Write error on '%s' (error %lu).", path, GetLastError());
+            UiLog("[!] Could not write to '%s'. Please check available disk space and permissions.", path);
             CloseHandle(file);
             return FALSE;
         }
@@ -192,34 +222,34 @@ static BOOL ParsePe(unsigned char* base, size_t size, PE_VIEW* view)
 
     if (size < sizeof(IMAGE_DOS_HEADER))
     {
-        UiLog("[!] File too small to be a PE image.");
+        UiLog("[!] The selected file is too small to be a valid executable.");
         return FALSE;
     }
 
     dos = (IMAGE_DOS_HEADER*)base;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE)
     {
-        UiLog("[!] Not a PE image (bad DOS signature).");
+        UiLog("[!] The selected file is not a valid Windows executable.");
         return FALSE;
     }
 
     if ((size_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > size)
     {
-        UiLog("[!] Malformed PE (NT headers out of range).");
+        UiLog("[!] The executable file header is invalid.");
         return FALSE;
     }
 
     nt = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE)
     {
-        UiLog("[!] Not a PE image (bad NT signature).");
+        UiLog("[!] The selected file is not a valid Windows executable.");
         return FALSE;
     }
 
     if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
         nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
     {
-        UiLog("[!] Only 64-bit (x64) PE images are supported.");
+        UiLog("[!] Only 64-bit (x64) versions of Cloudflare WARP are supported.");
         return FALSE;
     }
 
@@ -246,9 +276,73 @@ static BOOL IsCodeSection(const IMAGE_SECTION_HEADER* s)
            (s->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
 }
 
-/* Locate every occurrence of the known hostnames inside data sections. */
+/* Measure usable bytes in a registration slot laid out as
+   [string][zero pad][0xFF..FF marker][ptr=self][len]. Walk qwords to the
+   marker, requiring zero padding and a valid self fat-pointer after it; set
+   *outCapacity to the marker distance. FALSE if the layout doesn't match (the
+   caller then limits the replacement to the original length). */
+static BOOL MeasureRegSlot(
+    const PE_VIEW* view,
+    const OCCURRENCE* occ,
+    size_t* outCapacity)
+{
+    const size_t maxQwords = 8;   /* examine up to 64 bytes past the string */
+    size_t q = (occ->originalLength + 7) / 8;
+    size_t i;
+
+    for (; q < maxQwords; ++q)
+    {
+        size_t pos = occ->fileOffset + q * 8;
+        ULONGLONG word;
+
+        if (pos + 24 > view->size ||
+            pos + 24 < pos)
+        {
+            return FALSE;
+        }
+
+        memcpy(&word, view->base + pos, sizeof(word));
+        if (word != (ULONGLONG)-1)
+        {
+            continue;
+        }
+
+        /* Everything between the string end and the marker must be padding. */
+        for (i = occ->originalLength; i < q * 8; ++i)
+        {
+            if (view->base[occ->fileOffset + i] != 0)
+            {
+                return FALSE;
+            }
+        }
+
+        /* The marker must be followed by [ptr=self][len=originalLength]. */
+        memcpy(&word, view->base + pos + 8, sizeof(word));
+        if (word != occ->virtualAddr)
+        {
+            return FALSE;
+        }
+        memcpy(&word, view->base + pos + 16, sizeof(word));
+        if (word != (ULONGLONG)occ->originalLength)
+        {
+            return FALSE;
+        }
+
+        *outCapacity = q * 8;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+/* Locate every occurrence of the given hostnames in data sections. When
+   measureSlots is set (registration family), measure each slot's capacity so a
+   longer replacement can be allowed. */
 static size_t CollectOccurrences(
     const PE_VIEW* view,
+    const KNOWN_SNI* list,
+    size_t listCount,
+    BOOL measureSlots,
     OCCURRENCE* out,
     size_t maxOut)
 {
@@ -281,9 +375,9 @@ static size_t CollectOccurrences(
 
             /* Pick the longest hostname that matches here, so trailing-dot and
                "-proxy" variants win over their shorter prefixes. */
-            for (hi = 0; hi < sizeof(g_KnownHostnames) / sizeof(g_KnownHostnames[0]); ++hi)
+            for (hi = 0; hi < listCount; ++hi)
             {
-                const KNOWN_SNI* known = &g_KnownHostnames[hi];
+                const KNOWN_SNI* known = &list[hi];
                 if (off + known->length > secSize)
                 {
                     continue;
@@ -304,6 +398,14 @@ static size_t CollectOccurrences(
                 out[count].virtualAddr =
                     view->imageBase + s->VirtualAddress + off;
                 out[count].originalLength = best->length;
+                out[count].known = best;
+                out[count].slotConfirmed = FALSE;
+                out[count].slotCapacity = best->length;
+                if (measureSlots)
+                {
+                    out[count].slotConfirmed =
+                        MeasureRegSlot(view, &out[count], &out[count].slotCapacity);
+                }
                 count++;
                 /* Skip past this occurrence to avoid a prefix re-match inside it. */
                 off += best->length - 1;
@@ -314,11 +416,11 @@ static size_t CollectOccurrences(
     return count;
 }
 
-/* Overwrite the leading bytes of the hostname in place with the new SNI.
-   The tail (originalLength - newLen) is deliberately left untouched: Rust &str
-   is (ptr, len) with no NUL terminator, so the patched length alone bounds every
-   read, and preserving the tail avoids corrupting any string the linker
-   tail-merged into this one (e.g. a shared "cloudflareclient.com" suffix). */
+/* Overwrite the hostname in place with the new value. In a confirmed fixed slot
+   the rest is zeroed (the runtime reads only (ptr, len)). For packed
+   string-table literals the tail is left intact: with no NUL terminator the
+   patched length bounds every read, and a linker tail-merged suffix (e.g. a
+   shared "cloudflareclient.com") stays valid. */
 static void OverwriteHostname(
     PE_VIEW* view,
     const OCCURRENCE* occ,
@@ -327,6 +429,10 @@ static void OverwriteHostname(
 {
     unsigned char* dst = view->base + occ->fileOffset;
     memcpy(dst, newSni, newLen);
+    if (occ->slotConfirmed)
+    {
+        memset(dst + newLen, 0, occ->slotCapacity - newLen);
+    }
 }
 
 /* Rewrite Rust &'static str fat-pointer length fields ([ptr][len]) whose ptr
@@ -374,6 +480,10 @@ static DWORD PatchFatPointerLengths(
 
             for (oi = 0; oi < occCount; ++oi)
             {
+                if (!occs[oi].known->patchTarget)
+                {
+                    continue;
+                }
                 if (refVa == occs[oi].virtualAddr &&
                     refLen == (ULONGLONG)occs[oi].originalLength)
                 {
@@ -383,6 +493,154 @@ static DWORD PatchFatPointerLengths(
                     break;
                 }
             }
+        }
+    }
+
+    return patched;
+}
+
+/* Find the occurrence whose hostname lives at the given VA, or NULL. */
+static const OCCURRENCE* FindOccurrenceByVa(
+    const OCCURRENCE* occs,
+    size_t occCount,
+    ULONGLONG va)
+{
+    size_t oi;
+    for (oi = 0; oi < occCount; ++oi)
+    {
+        if (occs[oi].virtualAddr == va)
+        {
+            return &occs[oi];
+        }
+    }
+    return NULL;
+}
+
+/* Registration hosts also live in two parallel arrays -- [len..][ptr..] -- that
+   code indexes at runtime. Rewrite the len paired with each patched host, but
+   only after verifying the whole ptr run is known reg hostnames and every len
+   matches its hostname's real length, so unrelated arrays never match. */
+static DWORD PatchSoaLengths(
+    PE_VIEW* view,
+    const OCCURRENCE* occs,
+    size_t occCount,
+    size_t newLen)
+{
+    DWORD patched = 0;
+    WORD si;
+
+    for (si = 0; si < view->sectionCount; ++si)
+    {
+        const IMAGE_SECTION_HEADER* s = &view->sections[si];
+        unsigned char* secBase;
+        size_t secSize;
+        size_t off;
+
+        if (!IsDataSection(s))
+        {
+            continue;
+        }
+
+        secBase = view->base + s->PointerToRawData;
+        secSize = s->SizeOfRawData;
+        if (s->PointerToRawData + secSize > view->size)
+        {
+            secSize = view->size - s->PointerToRawData;
+        }
+
+        /* Scan on qword alignment; the arrays are compiler-emitted and
+           always aligned. */
+        for (off = 0; off + sizeof(ULONGLONG) <= secSize; )
+        {
+            ULONGLONG word;
+            size_t runStart;
+            size_t runEnd;
+            size_t runCount;
+            size_t lenBase;
+
+            memcpy(&word, secBase + off, sizeof(word));
+            if (!FindOccurrenceByVa(occs, occCount, word))
+            {
+                off += sizeof(ULONGLONG);
+                continue;
+            }
+
+            /* Expand to the full run of hostname-VA qwords around this hit. */
+            runStart = off;
+            while (runStart >= sizeof(ULONGLONG) &&
+                   runStart - sizeof(ULONGLONG) + sizeof(ULONGLONG) <= secSize)
+            {
+                ULONGLONG prev;
+                memcpy(&prev, secBase + runStart - sizeof(ULONGLONG), sizeof(prev));
+                if (!FindOccurrenceByVa(occs, occCount, prev))
+                {
+                    break;
+                }
+                runStart -= sizeof(ULONGLONG);
+            }
+            runEnd = off + sizeof(ULONGLONG);
+            while (runEnd + sizeof(ULONGLONG) <= secSize)
+            {
+                ULONGLONG next;
+                memcpy(&next, secBase + runEnd, sizeof(next));
+                if (!FindOccurrenceByVa(occs, occCount, next))
+                {
+                    break;
+                }
+                runEnd += sizeof(ULONGLONG);
+            }
+
+            runCount = (runEnd - runStart) / sizeof(ULONGLONG);
+            lenBase = runStart - runCount * sizeof(ULONGLONG);
+
+            if (runCount >= 2 &&
+                lenBase < runStart &&
+                runEnd <= secSize)
+            {
+                /* Verify the parallel len array pairs up with the ptr array. */
+                BOOL allMatch = TRUE;
+                size_t i;
+
+                for (i = 0; i < runCount; ++i)
+                {
+                    ULONGLONG ptr;
+                    ULONGLONG len;
+                    const OCCURRENCE* occ;
+
+                    memcpy(&ptr, secBase + runStart + i * sizeof(ULONGLONG), sizeof(ptr));
+                    memcpy(&len, secBase + lenBase + i * sizeof(ULONGLONG), sizeof(len));
+                    occ = FindOccurrenceByVa(occs, occCount, ptr);
+                    if (!occ || len != (ULONGLONG)occ->originalLength)
+                    {
+                        allMatch = FALSE;
+                        break;
+                    }
+                }
+
+                if (allMatch)
+                {
+                    for (i = 0; i < runCount; ++i)
+                    {
+                        ULONGLONG ptr;
+                        ULONGLONG len;
+                        const OCCURRENCE* occ;
+
+                        memcpy(&ptr, secBase + runStart + i * sizeof(ULONGLONG), sizeof(ptr));
+                        memcpy(&len, secBase + lenBase + i * sizeof(ULONGLONG), sizeof(len));
+                        occ = FindOccurrenceByVa(occs, occCount, ptr);
+
+                        if (occ->known->patchTarget && len != (ULONGLONG)newLen)
+                        {
+                            ULONGLONG newLen64 = (ULONGLONG)newLen;
+                            memcpy(secBase + lenBase + i * sizeof(ULONGLONG),
+                                   &newLen64, sizeof(newLen64));
+                            patched++;
+                        }
+                    }
+                }
+            }
+
+            off = runEnd;
         }
     }
 
@@ -512,7 +770,8 @@ static DWORD PatchCodeLengthImmediates(
 
             for (oi = 0; oi < occCount; ++oi)
             {
-                if (targetVa == occs[oi].virtualAddr)
+                if (occs[oi].known->patchTarget &&
+                    targetVa == occs[oi].virtualAddr)
                 {
                     matched = &occs[oi];
                     break;
@@ -577,7 +836,7 @@ BOOL StopWarpService(BOOL* outWasRunning)
     scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
     if (!scm)
     {
-        UiLog("[!] Cannot open Service Control Manager (error %lu).", GetLastError());
+        UiLog("[!] Could not connect to Windows Service Manager. Please run as Administrator.");
         return FALSE;
     }
 
@@ -591,13 +850,13 @@ BOOL StopWarpService(BOOL* outWasRunning)
         {
             return TRUE;   /* not installed: nothing to control */
         }
-        UiLog("[!] Cannot open service '%s' (error %lu).", WARP_SERVICE_NAME, err);
+        UiLog("[!] Could not access Cloudflare WARP service.");
         return FALSE;
     }
 
     if (!QueryServiceStatus(svc, &status))
     {
-        UiLog("[!] Cannot query service status (error %lu).", GetLastError());
+        UiLog("[!] Could not check service status.");
         CloseServiceHandle(svc);
         CloseServiceHandle(scm);
         return FALSE;
@@ -615,11 +874,12 @@ BOOL StopWarpService(BOOL* outWasRunning)
         *outWasRunning = TRUE;
     }
 
+    UiLog("Stop service...");
     if (status.dwCurrentState != SERVICE_STOP_PENDING)
     {
         if (!ControlService(svc, SERVICE_CONTROL_STOP, &status))
         {
-            UiLog("[!] Failed to send stop control (error %lu).", GetLastError());
+            UiLog("[!] Could not stop Cloudflare WARP service.");
             CloseServiceHandle(svc);
             CloseServiceHandle(scm);
             return FALSE;
@@ -642,8 +902,7 @@ BOOL StopWarpService(BOOL* outWasRunning)
 
     if (status.dwCurrentState != SERVICE_STOPPED)
     {
-        UiLog("[!] Service did not stop within %d seconds.",
-              SERVICE_WAIT_TIMEOUT_MS / 1000);
+        UiLog("[!] Cloudflare WARP service took too long to stop.");
         return FALSE;
     }
 
@@ -661,7 +920,7 @@ BOOL StartWarpService(void)
     scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
     if (!scm)
     {
-        UiLog("[!] Cannot open Service Control Manager (error %lu).", GetLastError());
+        UiLog("[!] Could not connect to Windows Service Manager. Please run as Administrator.");
         return FALSE;
     }
 
@@ -669,18 +928,18 @@ BOOL StartWarpService(void)
                        SERVICE_QUERY_STATUS | SERVICE_START);
     if (!svc)
     {
-        UiLog("[!] Cannot open service '%s' to start it (error %lu).",
-              WARP_SERVICE_NAME, GetLastError());
+        UiLog("[!] Could not open Cloudflare WARP service to start it.");
         CloseServiceHandle(scm);
         return FALSE;
     }
 
+    UiLog("Start service...");
     if (!StartServiceA(svc, 0, NULL))
     {
         DWORD err = GetLastError();
         if (err != ERROR_SERVICE_ALREADY_RUNNING)
         {
-            UiLog("[!] Failed to start service (error %lu).", err);
+            UiLog("[!] Could not start Cloudflare WARP service.");
             CloseServiceHandle(svc);
             CloseServiceHandle(scm);
             return FALSE;
@@ -708,8 +967,7 @@ BOOL StartWarpService(void)
 
     if (status.dwCurrentState != SERVICE_RUNNING)
     {
-        UiLog("[!] Service did not reach running state within %d seconds.",
-              SERVICE_WAIT_TIMEOUT_MS / 1000);
+        UiLog("[!] Cloudflare WARP service took too long to start.");
         return FALSE;
     }
 
@@ -772,14 +1030,14 @@ BOOL RemoveSideloadedUserenv(const char* target)
         return TRUE;   /* clean: no sideloaded DLL present */
     }
 
-    UiLog("[*] Found userenv.dll next to warp-svc.exe; deleting it.");
+    UiLog("Cleaning up leftover userenv.dll.");
     if (!DeleteFileA(dll))
     {
-        UiLog("[!] Failed to delete '%s' (error %lu).", dll, GetLastError());
+        UiLog("[!] Could not remove leftover '%s'.", dll);
         return FALSE;
     }
 
-    UiLog("[+] Removed %s.", dll);
+    UiLog("Cleaned up leftover userenv.dll.");
     return TRUE;
 }
 
@@ -889,6 +1147,30 @@ static BOOL ContainsNoCase(const char* haystack, const char* needle)
     return FALSE;
 }
 
+/* Case-insensitive whole-word substring search. */
+static BOOL ContainsWordNoCase(const char* haystack, const char* needle)
+{
+    size_t nlen = strlen(needle);
+    const char* p;
+    if (nlen == 0)
+    {
+        return TRUE;
+    }
+    for (p = haystack; *p; ++p)
+    {
+        if (_strnicmp(p, needle, nlen) == 0)
+        {
+            BOOL leftOk = (p == haystack) || !isalpha((unsigned char)*(p - 1));
+            BOOL rightOk = !isalpha((unsigned char)*(p + nlen));
+            if (leftOk && rightOk)
+            {
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
 /* Build the path to warp-cli.exe (next to the target) into cli. Returns FALSE
    if the target has no directory component or the CLI is not present. */
 static BOOL FindWarpCli(const char* target, char* cli, size_t cliSize)
@@ -926,7 +1208,6 @@ BOOL WarpDisconnectIfConnected(const char* target, BOOL* outWasConnected)
 
     if (!FindWarpCli(target, cli, sizeof(cli)))
     {
-        UiLog("[*] warp-cli.exe not found next to the target; skipping status check.");
         return TRUE;
     }
 
@@ -935,14 +1216,11 @@ BOOL WarpDisconnectIfConnected(const char* target, BOOL* outWasConnected)
 
     if (!RunAndCapture(cmd, NULL, output, sizeof(output), &exitCode))
     {
-        UiLog("[!] Could not run 'warp-cli status' (error %lu); continuing.",
-              GetLastError());
         return TRUE;
     }
 
-    if (!ContainsNoCase(output, "Connected"))
+    if (ContainsNoCase(output, "Disconnected") || !ContainsWordNoCase(output, "Connected"))
     {
-        UiLog("[*] WARP is not connected.");
         return TRUE;
     }
 
@@ -951,18 +1229,15 @@ BOOL WarpDisconnectIfConnected(const char* target, BOOL* outWasConnected)
         *outWasConnected = TRUE;
     }
 
-    UiLog("[*] WARP reports Connected; disconnecting before patch.");
+    UiLog("Disconnecting...");
     _snprintf(cmd, sizeof(cmd), "\"%s\" disconnect", cli);
     cmd[sizeof(cmd) - 1] = '\0';
 
     if (!RunAndCapture(cmd, NULL, output, sizeof(output), &exitCode))
     {
-        UiLog("[!] Failed to run 'warp-cli disconnect' (error %lu); continuing.",
-              GetLastError());
         return TRUE;
     }
 
-    UiLog("[+] Disconnected WARP.");
     return TRUE;
 }
 
@@ -977,21 +1252,18 @@ BOOL WarpConnect(const char* target)
 
     if (!FindWarpCli(target, cli, sizeof(cli)))
     {
-        UiLog("[*] warp-cli.exe not found next to the target; skipping reconnect.");
         return TRUE;
     }
 
-    UiLog("[*] Reconnecting WARP.");
     _snprintf(cmd, sizeof(cmd), "\"%s\" connect", cli);
     cmd[sizeof(cmd) - 1] = '\0';
 
     if (!RunAndCapture(cmd, NULL, output, sizeof(output), &exitCode))
     {
-        UiLog("[!] Failed to run 'warp-cli connect' (error %lu).", GetLastError());
+        UiLog("Note: You can reconnect the tunnel using the Cloudflare WARP app.");
         return FALSE;
     }
 
-    UiLog("[+] Reconnected WARP.");
     return TRUE;
 }
 
@@ -1006,7 +1278,7 @@ BOOL RunRestore(const char* target)
 
     if (!FileExists(backup))
     {
-        UiLog("[!] No backup found at '%s'. Nothing to restore.", backup);
+        UiLog("[!] No backup file found. There is nothing to restore.");
         return FALSE;
     }
 
@@ -1029,10 +1301,8 @@ BOOL RunRestore(const char* target)
             free(cur);
             if (targetSize != size)
             {
-                UiLog("[!] Backup size (%zu) does not match the current binary (%zu).",
-                      size, targetSize);
-                UiLog("    The backup is stale (likely from a previous WARP version).");
-                UiLog("    The current binary is already unpatched; delete %s.", backup);
+                UiLog("[!] The backup file is from a different version of Cloudflare WARP.");
+                UiLog("    The current warp-svc.exe is already an original unpatched version.");
                 free(data);
                 return FALSE;
             }
@@ -1046,71 +1316,168 @@ BOOL RunRestore(const char* target)
     }
 
     free(data);
-    UiLog("[+] Restored original binary.");
+    DeleteFileA(backup);
+    UiLog("Original file restored from backup.");
     return TRUE;
 }
 
-/* Patch the target's MASQUE SNI to newSni. Returns TRUE on success. */
-BOOL RunPatch(const char* target, const char* newSni)
+/* Count occurrences that are patch targets. */
+static size_t CountTargets(const OCCURRENCE* occs, size_t occCount)
+{
+    size_t n = 0;
+    size_t i;
+    for (i = 0; i < occCount; ++i)
+    {
+        if (occs[i].known->patchTarget)
+        {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Smallest length among the patch-target entries of a known-hostname list;
+   the replacement must fit inside it (in-place limit). */
+static size_t MinTargetLength(const KNOWN_SNI* list, size_t listCount)
+{
+    size_t best = (size_t)-1;
+    size_t i;
+    for (i = 0; i < listCount; ++i)
+    {
+        if (list[i].patchTarget && list[i].length < best)
+        {
+            best = list[i].length;
+        }
+    }
+    return best;
+}
+
+/* Largest length that every patch-target occurrence can hold in place. */
+static size_t MaxTargetCapacity(const OCCURRENCE* occs, size_t occCount)
+{
+    size_t best = (size_t)-1;
+    size_t i;
+    for (i = 0; i < occCount; ++i)
+    {
+        size_t cap;
+        if (!occs[i].known->patchTarget)
+        {
+            continue;
+        }
+        cap = occs[i].slotConfirmed ? occs[i].slotCapacity : occs[i].originalLength;
+        if (cap < best)
+        {
+            best = cap;
+        }
+    }
+    return best;
+}
+
+static const char* StripTrailingDot(const char* s, char* buf, size_t bufSize)
+{
+    size_t len;
+    if (!buf || bufSize == 0)
+    {
+        return s ? s : "";
+    }
+    if (!s)
+    {
+        buf[0] = '\0';
+        return buf;
+    }
+    len = strlen(s);
+    if (len > 0 && s[len - 1] == '.')
+    {
+        len--;
+    }
+    if (len >= bufSize)
+    {
+        len = bufSize - 1;
+    }
+    memcpy(buf, s, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+/* Patch the target's MASQUE SNI and registration API hostname. Returns TRUE
+   on success. */
+BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
 {
     char backup[MAX_PATH * 2];
     unsigned char* source = NULL;
     size_t sourceSize = 0;
     size_t targetSize = 0;
     PE_VIEW view;
-    OCCURRENCE occs[MAX_OCCURRENCES];
-    size_t occCount;
+    OCCURRENCE masqueOccs[MAX_OCCURRENCES];
+    OCCURRENCE regOccs[MAX_OCCURRENCES];
+    size_t masqueCount = 0;
+    size_t regCount = 0;
+    size_t masqueTargets;
+    size_t regTargets;
     size_t newLen;
-    size_t minHostLen;
+    size_t minMasqueLen;
+    size_t regLenPlain;
+    size_t regLenDotted;
+    size_t regLenFinal;
+    size_t regCap;
+    char regDotted[256];
+    const char* regFinal;
     size_t i;
-    DWORD lenFieldsPatched;
-    DWORD codeImmsPatched;
-
-    /* Determine the shortest known hostname; the new SNI must fit in place. */
-    minHostLen = (size_t)-1;
-    for (i = 0; i < sizeof(g_KnownHostnames) / sizeof(g_KnownHostnames[0]); ++i)
-    {
-        if (g_KnownHostnames[i].length < minHostLen)
-        {
-            minHostLen = g_KnownHostnames[i].length;
-        }
-    }
+    DWORD lenFieldsPatched = 0;
+    DWORD soaPatched = 0;
+    DWORD codeImmsPatched = 0;
+    BOOL regLenChanged;
 
     newLen = strlen(newSni);
+    minMasqueLen = MinTargetLength(g_MasqueHostnames, MASQUE_HOSTNAME_COUNT);
     if (newLen == 0)
     {
-        UiLog("[!] New SNI must not be empty.");
+        UiLog("[!] MASQUE SNI cannot be empty. Please enter a hostname (e.g. %s).", DEFAULT_SNI);
         return FALSE;
     }
-    if (newLen > minHostLen)
+    if (newLen > minMasqueLen)
     {
-        UiLog("[!] New SNI '%s' is %zu bytes; max is %zu (in-place limit).",
-              newSni, newLen, minHostLen);
+        UiLog("[!] The MASQUE SNI '%s' is too long (%zu characters; maximum allowed is %zu).",
+              newSni, newLen, minMasqueLen);
+        UiLog("    Tip: The default '%s' is recommended.", DEFAULT_SNI);
+        return FALSE;
+    }
+
+    regLenPlain = strlen(newRegSni);
+    if (regLenPlain == 0)
+    {
+        UiLog("[!] Registration API hostname cannot be empty. Please enter a hostname (e.g. %s).", DEFAULT_REG_SNI);
+        return FALSE;
+    }
+    if (regLenPlain > sizeof(regDotted) - 2)
+    {
+        UiLog("[!] The registration hostname is too long (maximum %zu characters).",
+              sizeof(regDotted) - 2);
+        UiLog("    Tip: The default '%s' is recommended.", DEFAULT_REG_SNI);
         return FALSE;
     }
 
     if (!FileExists(target))
     {
-        UiLog("[!] Target not found: %s", target);
-        UiLog("    Check the WARP service path field.");
+        UiLog("[!] Could not find warp-svc.exe at: %s", target);
+        UiLog("    Please verify the installation path.");
         return FALSE;
     }
 
     BuildBackupPath(target, backup, sizeof(backup));
 
-    /* Decide the pristine source by INSPECTING the target, not by blindly
-       trusting an existing backup. Our patch never changes the file size and a
-       pristine binary still contains the full MASQUE hostnames, so:
-         - target still has the hostnames  -> it is pristine (fresh install or a
-           fresh WARP update). Refresh the backup from it, patch it.
-         - target has none                 -> it is already patched. Fall back to
-           the backup, but only if the backup is pristine AND the same size as the
-           current target (a size mismatch means the backup is stale, i.e. from a
-           previous WARP version, and using it would downgrade the binary). */
+    /* Pick the pristine source by inspecting the target (patching never changes
+       the size): if every family's hostnames are present it is pristine, so
+       refresh the backup from it. Otherwise it is already patched -- use the
+       backup, but only if it is the same size (a mismatch means a stale backup
+       from an older WARP version, which would downgrade the binary). */
     {
         unsigned char* targetBuf;
         PE_VIEW targetView;
-        size_t targetOcc;
+        size_t tMasque;
+        size_t tReg;
+        BOOL masqOk;
+        BOOL regOk;
 
         targetBuf = ReadWholeFile(target, &targetSize);
         if (!targetBuf)
@@ -1122,9 +1489,16 @@ BOOL RunPatch(const char* target, const char* newSni)
             free(targetBuf);
             return FALSE;
         }
-        targetOcc = CollectOccurrences(&targetView, occs, MAX_OCCURRENCES);
+        tMasque = CollectOccurrences(&targetView, g_MasqueHostnames,
+                                     MASQUE_HOSTNAME_COUNT, FALSE,
+                                     masqueOccs, MAX_OCCURRENCES);
+        tReg = CollectOccurrences(&targetView, g_RegHostnames,
+                                  REG_HOSTNAME_COUNT, TRUE,
+                                  regOccs, MAX_OCCURRENCES);
+        masqOk = CountTargets(masqueOccs, tMasque) > 0;
+        regOk = CountTargets(regOccs, tReg) > 0;
 
-        if (targetOcc > 0)
+        if (masqOk && regOk)
         {
             /* Pristine target -> (re)create the backup from it. */
             if (!WriteWholeFile(backup, targetBuf, targetSize))
@@ -1135,7 +1509,9 @@ BOOL RunPatch(const char* target, const char* newSni)
             source = targetBuf;
             sourceSize = targetSize;
             view = targetView;
-            occCount = targetOcc;
+            masqueCount = tMasque;
+            regCount = tReg;
+            UiLog("Backup...");
         }
         else
         {
@@ -1144,8 +1520,8 @@ BOOL RunPatch(const char* target, const char* newSni)
 
             if (!FileExists(backup))
             {
-                UiLog("[!] No known MASQUE hostnames in the target and no backup exists.");
-                UiLog("    It may already be patched with no backup, or WARP changed its hostnames.");
+                UiLog("[!] Could not find original hostnames in warp-svc.exe and no backup exists.");
+                UiLog("    The file may already be patched, or this version of WARP is not supported.");
                 return FALSE;
             }
 
@@ -1157,10 +1533,8 @@ BOOL RunPatch(const char* target, const char* newSni)
 
             if (sourceSize != targetSize)
             {
-                UiLog("[!] Backup size (%zu) does not match the current binary (%zu).",
-                      sourceSize, targetSize);
-                UiLog("    The backup is stale (likely from a previous WARP version).");
-                UiLog("    Delete %s and re-run against the fresh binary.", backup);
+                UiLog("[!] The backup file is from a different version of Cloudflare WARP.");
+                UiLog("    Please delete '%s' and re-run against a fresh installation.", backup);
                 free(source);
                 return FALSE;
             }
@@ -1170,26 +1544,101 @@ BOOL RunPatch(const char* target, const char* newSni)
                 free(source);
                 return FALSE;
             }
-            occCount = CollectOccurrences(&view, occs, MAX_OCCURRENCES);
-            if (occCount == 0)
+
+            masqueCount = CollectOccurrences(&view, g_MasqueHostnames,
+                                             MASQUE_HOSTNAME_COUNT, FALSE,
+                                             masqueOccs, MAX_OCCURRENCES);
+            regCount = CollectOccurrences(&view, g_RegHostnames,
+                                          REG_HOSTNAME_COUNT, TRUE,
+                                          regOccs, MAX_OCCURRENCES);
+            if (CountTargets(masqueOccs, masqueCount) == 0 ||
+                CountTargets(regOccs, regCount) == 0)
             {
-                UiLog("[!] Backup has no known MASQUE hostnames either; cannot patch.");
-                UiLog("    WARP may have changed its hostnames; the patcher needs updating.");
+                UiLog("[!] Could not find original hostnames in the backup file.");
+                UiLog("    This version of Cloudflare WARP may not be supported.");
                 free(source);
                 return FALSE;
             }
         }
     }
 
-    for (i = 0; i < occCount; ++i)
+    masqueTargets = CountTargets(masqueOccs, masqueCount);
+    regTargets = CountTargets(regOccs, regCount);
+
+    /* Every API host is stored as a trailing-dot FQDN, so prefer the dotted
+       form of the input; fall back to as-typed only when that alone fits. */
+    if (newRegSni[regLenPlain - 1] == '.')
     {
-        OverwriteHostname(&view, &occs[i], newSni, newLen);
+        regLenDotted = regLenPlain;
+        _snprintf(regDotted, sizeof(regDotted), "%s", newRegSni);
+    }
+    else
+    {
+        regLenDotted = regLenPlain + 1;
+        _snprintf(regDotted, sizeof(regDotted), "%s.", newRegSni);
+    }
+    regDotted[sizeof(regDotted) - 1] = '\0';
+
+    regCap = MaxTargetCapacity(regOccs, regCount);
+    if (regLenDotted <= regCap)
+    {
+        regFinal = regDotted;
+        regLenFinal = regLenDotted;
+    }
+    else if (regLenPlain <= regCap)
+    {
+        regFinal = newRegSni;
+        regLenFinal = regLenPlain;
+    }
+    else
+    {
+        UiLog("[!] Registration hostname '%s' is too long (%zu characters; maximum is %zu).",
+              newRegSni, regLenPlain, regCap);
+        UiLog("    Tip: The default '%s' is recommended.", DEFAULT_REG_SNI);
+        free(source);
+        return FALSE;
     }
 
-    lenFieldsPatched = PatchFatPointerLengths(&view, occs, occCount, newLen);
-    codeImmsPatched = PatchCodeLengthImmediates(&view, occs, occCount, newLen);
-    (void)lenFieldsPatched;
-    (void)codeImmsPatched;
+    /* Overwrite the hostname strings in place. */
+    for (i = 0; i < masqueCount; ++i)
+    {
+        if (masqueOccs[i].known->patchTarget)
+        {
+            OverwriteHostname(&view, &masqueOccs[i], newSni, newLen);
+        }
+    }
+    for (i = 0; i < regCount; ++i)
+    {
+        if (regOccs[i].known->patchTarget)
+        {
+            OverwriteHostname(&view, &regOccs[i], regFinal, regLenFinal);
+        }
+    }
+
+    lenFieldsPatched += PatchFatPointerLengths(&view, masqueOccs, masqueCount, newLen);
+    lenFieldsPatched += PatchFatPointerLengths(&view, regOccs, regCount, regLenFinal);
+    soaPatched = PatchSoaLengths(&view, regOccs, regCount, regLenFinal);
+    codeImmsPatched += PatchCodeLengthImmediates(&view, masqueOccs, masqueCount, newLen);
+    codeImmsPatched += PatchCodeLengthImmediates(&view, regOccs, regCount, regLenFinal);
+
+    /* If the reg length changed, the ptr/len array must have been updated, or
+       the service would read a truncated hostname -- refuse to write. */
+    regLenChanged = FALSE;
+    for (i = 0; i < regCount; ++i)
+    {
+        if (regOccs[i].known->patchTarget &&
+            regOccs[i].originalLength != regLenFinal)
+        {
+            regLenChanged = TRUE;
+        }
+    }
+    if (regLenChanged && soaPatched == 0)
+    {
+        UiLog("[!] Could not safely update registration hostname in this version of WARP.");
+        UiLog("    Tip: The default '%s' is recommended.", DEFAULT_REG_SNI);
+        free(source);
+        return FALSE;
+    }
 
     if (!WriteWholeFile(target, view.base, view.size))
     {
@@ -1198,6 +1647,119 @@ BOOL RunPatch(const char* target, const char* newSni)
     }
 
     free(source);
-    UiLog("[+] Patched %s -> %s (%zu hostnames).", target, newSni, occCount);
+    {
+        char uniqueMasque[16][256];
+        size_t uniqueMasqueCount = 0;
+        char uniqueReg[16][256];
+        size_t uniqueRegCount = 0;
+        char cleanNewSni[256];
+        char cleanNewRegSni[256];
+        size_t k, u;
+
+        memset(uniqueMasque, 0, sizeof(uniqueMasque));
+        memset(uniqueReg, 0, sizeof(uniqueReg));
+        memset(cleanNewSni, 0, sizeof(cleanNewSni));
+        memset(cleanNewRegSni, 0, sizeof(cleanNewRegSni));
+
+        StripTrailingDot(newSni, cleanNewSni, sizeof(cleanNewSni));
+        StripTrailingDot(newRegSni, cleanNewRegSni, sizeof(cleanNewRegSni));
+
+        /* Collect unique patched MASQUE hostnames in definition order */
+        for (k = 0; k < MASQUE_HOSTNAME_COUNT; ++k)
+        {
+            if (!g_MasqueHostnames[k].patchTarget)
+            {
+                continue;
+            }
+            for (i = 0; i < masqueCount; ++i)
+            {
+                if (masqueOccs[i].known == &g_MasqueHostnames[k])
+                {
+                    char clean[256];
+                    memset(clean, 0, sizeof(clean));
+                    StripTrailingDot(g_MasqueHostnames[k].value, clean, sizeof(clean));
+                    BOOL exists = FALSE;
+                    for (u = 0; u < uniqueMasqueCount; ++u)
+                    {
+                        if (strcmp(uniqueMasque[u], clean) == 0)
+                        {
+                            exists = TRUE;
+                            break;
+                        }
+                    }
+                    if (!exists && uniqueMasqueCount < 16)
+                    {
+                        _snprintf(uniqueMasque[uniqueMasqueCount],
+                                  sizeof(uniqueMasque[uniqueMasqueCount]),
+                                  "%s", clean);
+                        uniqueMasqueCount++;
+                    }
+                    break;
+                }
+            }
+        }
+
+        /* Collect unique patched Registration hostnames in definition order */
+        for (k = 0; k < REG_HOSTNAME_COUNT; ++k)
+        {
+            if (!g_RegHostnames[k].patchTarget)
+            {
+                continue;
+            }
+            for (i = 0; i < regCount; ++i)
+            {
+                if (regOccs[i].known == &g_RegHostnames[k])
+                {
+                    char clean[256];
+                    memset(clean, 0, sizeof(clean));
+                    StripTrailingDot(g_RegHostnames[k].value, clean, sizeof(clean));
+                    BOOL exists = FALSE;
+                    for (u = 0; u < uniqueRegCount; ++u)
+                    {
+                        if (strcmp(uniqueReg[u], clean) == 0)
+                        {
+                            exists = TRUE;
+                            break;
+                        }
+                    }
+                    if (!exists && uniqueRegCount < 16)
+                    {
+                        _snprintf(uniqueReg[uniqueRegCount],
+                                  sizeof(uniqueReg[uniqueRegCount]),
+                                  "%s", clean);
+                        uniqueRegCount++;
+                    }
+                    break;
+                }
+            }
+        }
+
+        UiLog("Patching...");
+        /* UiLog("MASQUE SNI:");
+        if (uniqueMasqueCount > 0)
+        {
+            for (u = 0; u < uniqueMasqueCount; ++u)
+            {
+                UiLog("%s -> %s", uniqueMasque[u], cleanNewSni);
+            }
+        }
+        else
+        {
+            UiLog("-> %s", cleanNewSni);
+        }
+
+        UiLog("Registration API:");
+        if (uniqueRegCount > 0)
+        {
+            for (u = 0; u < uniqueRegCount; ++u)
+            {
+                UiLog("%s -> %s", uniqueReg[u], cleanNewRegSni);
+            }
+        }
+        else
+        {
+            UiLog("-> %s", cleanNewRegSni);
+        } */
+    }
     return TRUE;
 }

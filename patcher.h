@@ -19,12 +19,14 @@
 
 #define DEFAULT_TARGET_PATH \
     "C:\\Program Files\\Cloudflare\\Cloudflare WARP\\warp-svc.exe"
-#define DEFAULT_SNI "cloudflare.com"
+#define DEFAULT_SNI "speed.cloudflare.com"
+#define DEFAULT_REG_SNI "api.devices.cloudflare.com"
 
 /* ---- Core (patcher.c) ---- */
 
-/* Patch the target's MASQUE SNI to newSni. Returns TRUE on success. */
-BOOL RunPatch(const char* target, const char* newSni);
+/* Patch the target's MASQUE SNI (newSni) and registration API hostname
+   (newRegSni). Returns TRUE on success. */
+BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni);
 
 /* Restore the original binary from its .bak. Returns TRUE on success. */
 BOOL RunRestore(const char* target);

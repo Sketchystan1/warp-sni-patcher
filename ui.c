@@ -16,6 +16,8 @@
 #include <uxtheme.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
+#include <stdlib.h>
 
 /* Common-Controls v6 gives buttons, scrollbars and edits the modern themed
    look. The manifest dependency is merged into the linker-embedded manifest;
@@ -27,33 +29,41 @@
     "processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 /* Control IDs */
-#define IDC_PATH_EDIT    1001
-#define IDC_SNI_EDIT     1002
-#define IDC_BROWSE_BTN   1003
+#define IDC_SNI_EDIT     1001
+#define IDC_REGSNI_EDIT  1002
+#define IDC_RESTORE_BTN  1003
 #define IDC_PATCH_BTN    1004
-#define IDC_RESTORE_BTN  1005
-#define IDC_LOG_EDIT     1006
+#define IDC_LOG_EDIT     1005
 
 /* Layout constants (client-relative pixels). */
-#define UI_MARGIN        16
-#define UI_ROW_H         26
-#define UI_BTN_H         30
-#define UI_MIN_WIDTH     420
-#define UI_MIN_HEIGHT    320
+#define UI_MARGIN               16
+#define UI_ROW_H                26
+#define UI_BTN_H                30
+#define UI_MIN_WIDTH            460
+#define UI_COMPACT_CLIENT_H     228
+#define UI_EXPANDED_CLIENT_H    380
 
+static HWND g_hMainWindow = NULL;
 static HWND g_hLog = NULL;      /* multiline log edit control */
 static HFONT g_hUiFont = NULL;  /* Segoe UI, for labels/edits/buttons */
 static HFONT g_hMonoFont = NULL;/* Consolas, for the log */
 
 /* Child control handles, kept so WM_SIZE can reflow the layout. */
-static HWND g_hPathLabel = NULL;
-static HWND g_hPathEdit = NULL;
-static HWND g_hBrowseBtn = NULL;
+static HWND g_hHintLabel = NULL;
 static HWND g_hSniLabel = NULL;
 static HWND g_hSniEdit = NULL;
+static HWND g_hRegSniLabel = NULL;
+static HWND g_hRegSniEdit = NULL;
 static HWND g_hRestoreBtn = NULL;
 static HWND g_hPatchBtn = NULL;
 static HWND g_hLogLabel = NULL;
+static BOOL g_logVisible = FALSE;
+
+static DWORD g_mainThreadId = 0;
+static HANDLE g_hWorkerThread = NULL;
+
+#define WM_APP_LOG         (WM_APP + 1)
+#define WM_APP_WORKER_DONE (WM_APP + 2)
 
 /* ---- Dark mode -------------------------------------------------------------
  * A minimal adaptation of ozone10/win32-darkmodelib: we ask Windows to allow
@@ -145,10 +155,9 @@ static void ApplyAppTheme(HWND hwnd)
     {
         const wchar_t* cfd = dark ? L"DarkMode_CFD" : NULL;
         const wchar_t* exp = dark ? L"DarkMode_Explorer" : NULL;
-        SetWindowTheme(g_hPathEdit, cfd, NULL);
         SetWindowTheme(g_hSniEdit, cfd, NULL);
+        SetWindowTheme(g_hRegSniEdit, cfd, NULL);
         SetWindowTheme(g_hLog, exp, NULL);
-        SetWindowTheme(g_hBrowseBtn, exp, NULL);
         SetWindowTheme(g_hRestoreBtn, exp, NULL);
         SetWindowTheme(g_hPatchBtn, exp, NULL);
     }
@@ -171,6 +180,69 @@ static HFONT MakeFont(const char* face, int pointSize, int weight)
     return font ? font : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 }
 
+static void LayoutControls(HWND hwnd);
+
+/* Expand the window to show the log box when patching/restoring starts. */
+static void EnsureLogVisible(HWND hwnd)
+{
+    if (g_logVisible || !hwnd)
+    {
+        return;
+    }
+
+    g_logVisible = TRUE;
+
+    RECT rcWin, rcClient;
+    GetWindowRect(hwnd, &rcWin);
+    GetClientRect(hwnd, &rcClient);
+
+    int curClientH = rcClient.bottom - rcClient.top;
+    int targetClientH = UI_EXPANDED_CLIENT_H;
+    int diffH = targetClientH - curClientH;
+    if (diffH > 0)
+    {
+        int newWinH = (rcWin.bottom - rcWin.top) + diffH;
+        int newTop = rcWin.top;
+        RECT work;
+        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0))
+        {
+            if (newTop + newWinH > work.bottom)
+            {
+                newTop = work.bottom - newWinH;
+                if (newTop < work.top)
+                {
+                    newTop = work.top;
+                }
+            }
+        }
+        SetWindowPos(hwnd, NULL, rcWin.left, newTop,
+                     rcWin.right - rcWin.left, newWinH,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    if (g_hLogLabel) ShowWindow(g_hLogLabel, SW_SHOW);
+    if (g_hLog) ShowWindow(g_hLog, SW_SHOW);
+    LayoutControls(hwnd);
+    InvalidateRect(hwnd, NULL, TRUE);
+    UpdateWindow(hwnd);
+}
+
+static void AppendLogText(const char* line)
+{
+    if (!g_logVisible && g_hMainWindow)
+    {
+        EnsureLogVisible(g_hMainWindow);
+    }
+
+    if (g_hLog)
+    {
+        int len = GetWindowTextLengthA(g_hLog);
+        SendMessageA(g_hLog, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+        SendMessageA(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)line);
+        SendMessageA(g_hLog, EM_SCROLLCARET, 0, 0);
+    }
+}
+
 /* Append a formatted line to the GUI log control (CRLF-terminated). */
 void UiLog(const char* fmt, ...)
 {
@@ -189,12 +261,23 @@ void UiLog(const char* fmt, ...)
     line[n + 1] = '\n';
     line[n + 2] = '\0';
 
-    if (g_hLog)
+    if (g_hMainWindow)
     {
-        int len = GetWindowTextLengthA(g_hLog);
-        SendMessageA(g_hLog, EM_SETSEL, (WPARAM)len, (LPARAM)len);
-        SendMessageA(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)line);
-        SendMessageA(g_hLog, EM_SCROLLCARET, 0, 0);
+        if (g_mainThreadId != 0 && GetCurrentThreadId() == g_mainThreadId)
+        {
+            AppendLogText(line);
+        }
+        else
+        {
+            char* copy = _strdup(line);
+            if (copy)
+            {
+                if (!PostMessageA(g_hMainWindow, WM_APP_LOG, 0, (LPARAM)copy))
+                {
+                    free(copy);
+                }
+            }
+        }
     }
 }
 
@@ -203,145 +286,245 @@ static void GetEditText(HWND parent, int id, char* buf, int bufSize)
     GetWindowTextA(GetDlgItem(parent, id), buf, bufSize);
 }
 
-/* Show the Restore button only when a usable backup exists: the .bak must be
-   present AND the same size as the current target. A size mismatch means WARP
-   updated the exe after the backup was taken, so the backup is stale and
-   restoring it would downgrade the binary -- hide Restore in that case. */
+/* Strip leading/trailing spaces and tabs in place. */
+static void TrimInPlace(char* s)
+{
+    char* start = s;
+    char* end;
+
+    while (*start == ' ' || *start == '\t')
+    {
+        start++;
+    }
+
+    end = start + strlen(start);
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
+    {
+        end--;
+    }
+    *end = '\0';
+
+    if (start != s)
+    {
+        memmove(s, start, (size_t)(end - start) + 1);
+    }
+}
+
+/* Show the Restore button only when a backup file exists. */
 static void UpdateRestoreButton(HWND hwnd)
 {
-    char target[MAX_PATH];
     char backup[MAX_PATH * 2];
     BOOL show = FALSE;
 
+    (void)hwnd;
     if (g_hRestoreBtn)
     {
-        GetEditText(hwnd, IDC_PATH_EDIT, target, sizeof(target));
-        if (target[0] != '\0' && FileExists(target))
-        {
-            BuildBackupPath(target, backup, sizeof(backup));
-            if (FileExists(backup))
-            {
-                ULONGLONG bak = FileSize64(backup);
-                ULONGLONG cur = FileSize64(target);
-                show = (bak != (ULONGLONG)-1 && bak == cur);
-            }
-        }
+        BuildBackupPath(DEFAULT_TARGET_PATH, backup, sizeof(backup));
+        show = FileExists(backup);
         ShowWindow(g_hRestoreBtn, show ? SW_SHOW : SW_HIDE);
     }
 }
 
-static void BrowseForTarget(HWND hwnd)
+typedef struct {
+    char target[MAX_PATH * 2];
+    char sni[256];
+    char regSni[256];
+    BOOL isRestore;
+} WORKER_PARAMS;
+
+static void SetUiBusy(BOOL busy, BOOL isRestore)
 {
-    OPENFILENAMEA ofn;
-    char path[MAX_PATH];
-
-    GetEditText(hwnd, IDC_PATH_EDIT, path, sizeof(path));
-
-    memset(&ofn, 0, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = hwnd;
-    ofn.lpstrFilter = "Executable (*.exe)\0*.exe\0All files (*.*)\0*.*\0";
-    ofn.lpstrFile = path;
-    ofn.nMaxFile = sizeof(path);
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
-    ofn.lpstrTitle = "Select warp-svc.exe";
-
-    if (GetOpenFileNameA(&ofn))
+    if (g_hPatchBtn)
     {
-        SetWindowTextA(GetDlgItem(hwnd, IDC_PATH_EDIT), path);
-        UpdateRestoreButton(hwnd);
+        EnableWindow(g_hPatchBtn, !busy);
+        if (busy && !isRestore)
+        {
+            SetWindowTextA(g_hPatchBtn, "Patching...");
+        }
     }
+    if (g_hRestoreBtn)
+    {
+        EnableWindow(g_hRestoreBtn, !busy);
+        if (busy && isRestore)
+        {
+            SetWindowTextA(g_hRestoreBtn, "Restoring...");
+        }
+    }
+    if (g_hSniEdit)
+    {
+        EnableWindow(g_hSniEdit, !busy);
+    }
+    if (g_hRegSniEdit)
+    {
+        EnableWindow(g_hRegSniEdit, !busy);
+    }
+}
+
+static DWORD WINAPI PatchWorkerThread(LPVOID lpParam)
+{
+    WORKER_PARAMS* p = (WORKER_PARAMS*)lpParam;
+    BOOL success = FALSE;
+
+    if (!p->isRestore)
+    {
+        BOOL wasRunning = FALSE;
+
+        WarpDisconnectIfConnected(p->target, NULL);
+
+        if (!StopWarpService(&wasRunning))
+        {
+            UiLog("[!] Could not stop Cloudflare WARP service. Please ensure the app is running as Administrator.");
+            goto finish;
+        }
+
+        RemoveSideloadedUserenv(p->target);
+
+        success = RunPatch(p->target, p->sni, p->regSni);
+
+        StartWarpService();
+
+        if (success)
+        {
+            UiLog("Done!");
+        }
+        else
+        {
+            UiLog("[!] Patch could not be applied. Your original files were left unchanged.");
+        }
+    }
+    else
+    {
+        BOOL wasRunning = FALSE;
+
+        if (!StopWarpService(&wasRunning))
+        {
+            UiLog("[!] Could not stop Cloudflare WARP service. Please ensure the app is running as Administrator.");
+            goto finish;
+        }
+
+        success = RunRestore(p->target);
+
+        StartWarpService();
+
+        if (success)
+        {
+            UiLog("Done!");
+        }
+        else
+        {
+            UiLog("[!] Restore could not be completed. Please check that a .bak backup file exists.");
+        }
+    }
+
+finish:
+    PostMessageA(g_hMainWindow, WM_APP_WORKER_DONE, (WPARAM)p->isRestore, (LPARAM)success);
+    free(p);
+    return 0;
 }
 
 static void OnPatchClicked(HWND hwnd)
 {
-    char target[MAX_PATH];
-    char sni[256];
-
-    GetEditText(hwnd, IDC_PATH_EDIT, target, sizeof(target));
-    GetEditText(hwnd, IDC_SNI_EDIT, sni, sizeof(sni));
-
-    if (target[0] == '\0')
+    if (g_hWorkerThread != NULL)
     {
-        UiLog("[!] WARP service path is empty.");
         return;
     }
 
-    UiLog("=== Patch: SNI -> '%s' ===", sni);
+    const char* target = DEFAULT_TARGET_PATH;
+    char sni[256];
+    char regSni[256];
+    WORKER_PARAMS* p;
 
+    EnsureLogVisible(hwnd);
+    if (g_hLog)
     {
-        BOOL wasRunning = FALSE;
-        BOOL wasConnected = FALSE;
-        BOOL patched;
+        SetWindowTextA(g_hLog, "");
+    }
 
-        /* Bring the tunnel down first (needs the service running) so patching
-           does not race a live connection. */
-        WarpDisconnectIfConnected(target, &wasConnected);
+    GetEditText(hwnd, IDC_SNI_EDIT, sni, sizeof(sni));
+    GetEditText(hwnd, IDC_REGSNI_EDIT, regSni, sizeof(regSni));
+    TrimInPlace(sni);
+    TrimInPlace(regSni);
 
-        if (!StopWarpService(&wasRunning))
-        {
-            UiLog("[!] Could not stop the service; aborting so the running "
-                  "binary is not modified.");
-            return;
-        }
+    if (!FileExists(target))
+    {
+        UiLog("[!] Cloudflare WARP service executable not found at:");
+        UiLog("    %s", target);
+        UiLog("    Please make sure Cloudflare WARP is installed.");
+        return;
+    }
 
-        /* With the service stopped, clear any sideloaded userenv.dll next to
-           the target before we patch and restart. */
-        RemoveSideloadedUserenv(target);
+    p = (WORKER_PARAMS*)malloc(sizeof(WORKER_PARAMS));
+    if (!p)
+    {
+        UiLog("[!] Memory allocation failed.");
+        return;
+    }
 
-        patched = RunPatch(target, sni);
+    strncpy(p->target, target, sizeof(p->target) - 1);
+    p->target[sizeof(p->target) - 1] = '\0';
+    strncpy(p->sni, sni, sizeof(p->sni) - 1);
+    p->sni[sizeof(p->sni) - 1] = '\0';
+    strncpy(p->regSni, regSni, sizeof(p->regSni) - 1);
+    p->regSni[sizeof(p->regSni) - 1] = '\0';
+    p->isRestore = FALSE;
 
-        if (wasRunning)
-        {
-            StartWarpService();
-        }
+    SetUiBusy(TRUE, FALSE);
 
-        /* Restore the tunnel if it was up before we started (needs the service
-           running again). */
-        if (wasConnected)
-        {
-            WarpConnect(target);
-        }
-
-        UiLog(patched ? "[+] Done." : "[!] Patch failed.");
-        UpdateRestoreButton(hwnd);
+    g_hWorkerThread = CreateThread(NULL, 0, PatchWorkerThread, p, 0, NULL);
+    if (!g_hWorkerThread)
+    {
+        UiLog("[!] Failed to create background thread.");
+        SetUiBusy(FALSE, FALSE);
+        free(p);
     }
 }
 
 static void OnRestoreClicked(HWND hwnd)
 {
-    char target[MAX_PATH];
-
-    GetEditText(hwnd, IDC_PATH_EDIT, target, sizeof(target));
-
-    if (target[0] == '\0')
+    if (g_hWorkerThread != NULL)
     {
-        UiLog("[!] WARP service path is empty.");
         return;
     }
 
-    UiLog("=== Restore original ===");
+    const char* target = DEFAULT_TARGET_PATH;
+    char backup[MAX_PATH * 2];
+    WORKER_PARAMS* p;
 
+    EnsureLogVisible(hwnd);
+    if (g_hLog)
     {
-        BOOL wasRunning = FALSE;
-        BOOL restored;
+        SetWindowTextA(g_hLog, "");
+    }
 
-        if (!StopWarpService(&wasRunning))
-        {
-            UiLog("[!] Could not stop the service; aborting so the running "
-                  "binary is not modified.");
-            return;
-        }
-
-        restored = RunRestore(target);
-
-        if (wasRunning)
-        {
-            StartWarpService();
-        }
-
-        UiLog(restored ? "[+] Done." : "[!] Restore failed.");
+    BuildBackupPath(target, backup, sizeof(backup));
+    if (!FileExists(backup))
+    {
+        UiLog("[!] No backup file found. There is nothing to restore.");
         UpdateRestoreButton(hwnd);
+        return;
+    }
+
+    p = (WORKER_PARAMS*)malloc(sizeof(WORKER_PARAMS));
+    if (!p)
+    {
+        UiLog("[!] Memory allocation failed.");
+        return;
+    }
+
+    strncpy(p->target, target, sizeof(p->target) - 1);
+    p->target[sizeof(p->target) - 1] = '\0';
+    p->sni[0] = '\0';
+    p->regSni[0] = '\0';
+    p->isRestore = TRUE;
+
+    SetUiBusy(TRUE, TRUE);
+
+    g_hWorkerThread = CreateThread(NULL, 0, PatchWorkerThread, p, 0, NULL);
+    if (!g_hWorkerThread)
+    {
+        UiLog("[!] Failed to create background thread.");
+        SetUiBusy(FALSE, TRUE);
+        free(p);
     }
 }
 
@@ -375,25 +558,37 @@ static void LayoutControls(HWND hwnd)
     }
     y = m;
 
-    MoveWindow(g_hPathLabel, m, y, fieldW, 18, TRUE);
-    y += 22;
-    MoveWindow(g_hPathEdit, m, y, fieldW - browseW - gap, UI_ROW_H, TRUE);
-    MoveWindow(g_hBrowseBtn, m + fieldW - browseW, y, browseW, UI_ROW_H, TRUE);
-    y += UI_ROW_H + 14;
+    MoveWindow(g_hHintLabel, m, y, fieldW, 32, TRUE);
+    y += 32 + 10;
 
     MoveWindow(g_hSniLabel, m, y, fieldW, 18, TRUE);
     y += 22;
     MoveWindow(g_hSniEdit, m, y, fieldW, UI_ROW_H, TRUE);
-    y += UI_ROW_H + 14;
+    y += UI_ROW_H + 12;
+
+    MoveWindow(g_hRegSniLabel, m, y, fieldW, 18, TRUE);
+    y += 22;
+    MoveWindow(g_hRegSniEdit, m, y, fieldW, UI_ROW_H, TRUE);
+    y += UI_ROW_H + 16;
 
     MoveWindow(g_hRestoreBtn, m + fieldW - btnW - gap - btnW, y, btnW, UI_BTN_H, TRUE);
     MoveWindow(g_hPatchBtn, m + fieldW - btnW, y, btnW, UI_BTN_H, TRUE);
     y += UI_BTN_H + 16;
 
-    MoveWindow(g_hLogLabel, m, y, fieldW, 18, TRUE);
-    y += 22;
-    logTop = y;
-    MoveWindow(g_hLog, m, logTop, fieldW, rc.bottom - logTop - m, TRUE);
+    if (g_logVisible)
+    {
+        ShowWindow(g_hLogLabel, SW_SHOW);
+        ShowWindow(g_hLog, SW_SHOW);
+        MoveWindow(g_hLogLabel, m, y, fieldW, 18, TRUE);
+        y += 22;
+        logTop = y;
+        MoveWindow(g_hLog, m, logTop, fieldW, rc.bottom - logTop - m, TRUE);
+    }
+    else
+    {
+        ShowWindow(g_hLogLabel, SW_HIDE);
+        ShowWindow(g_hLog, SW_HIDE);
+    }
 }
 
 static void CreateControls(HWND hwnd)
@@ -402,17 +597,10 @@ static void CreateControls(HWND hwnd)
     g_hUiFont = MakeFont("Segoe UI", 10, FW_NORMAL);
     g_hMonoFont = MakeFont("Consolas", 10, FW_NORMAL);
 
-    g_hPathLabel = CreateLabel(hwnd, "WARP service executable", 0, 0, 10, 18);
-    g_hPathEdit = CreateWindowExA(
-        0, "EDIT", DEFAULT_TARGET_PATH,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
-        0, 0, 10, UI_ROW_H, hwnd, (HMENU)(INT_PTR)IDC_PATH_EDIT, NULL, NULL);
-    SendMessageA(g_hPathEdit, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
-    g_hBrowseBtn = CreateWindowExA(
-        0, "BUTTON", "Browse...",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        0, 0, 10, UI_ROW_H, hwnd, (HMENU)(INT_PTR)IDC_BROWSE_BTN, NULL, NULL);
-    SendMessageA(g_hBrowseBtn, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+    g_hHintLabel = CreateLabel(
+        hwnd,
+        "Tip: Replaces blocked WARP hostnames to restore connection.\r\nPre-filled hosts are recommended. Just click Patch.",
+        0, 0, 10, 32);
 
     g_hSniLabel = CreateLabel(hwnd, "New MASQUE SNI hostname", 0, 0, 10, 18);
     g_hSniEdit = CreateWindowExA(
@@ -421,9 +609,17 @@ static void CreateControls(HWND hwnd)
         0, 0, 10, UI_ROW_H, hwnd, (HMENU)(INT_PTR)IDC_SNI_EDIT, NULL, NULL);
     SendMessageA(g_hSniEdit, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
 
+    g_hRegSniLabel = CreateLabel(
+        hwnd, "New registration API hostname", 0, 0, 10, 18);
+    g_hRegSniEdit = CreateWindowExA(
+        0, "EDIT", DEFAULT_REG_SNI,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
+        0, 0, 10, UI_ROW_H, hwnd, (HMENU)(INT_PTR)IDC_REGSNI_EDIT, NULL, NULL);
+    SendMessageA(g_hRegSniEdit, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+
     g_hRestoreBtn = CreateWindowExA(
-        0, "BUTTON", "Restore Original",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        0, "BUTTON", "Restore",
+        WS_CHILD | WS_TABSTOP,
         0, 0, 10, UI_BTN_H, hwnd, (HMENU)(INT_PTR)IDC_RESTORE_BTN, NULL, NULL);
     SendMessageA(g_hRestoreBtn, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
     g_hPatchBtn = CreateWindowExA(
@@ -432,16 +628,19 @@ static void CreateControls(HWND hwnd)
         0, 0, 10, UI_BTN_H, hwnd, (HMENU)(INT_PTR)IDC_PATCH_BTN, NULL, NULL);
     SendMessageA(g_hPatchBtn, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
 
-    g_hLogLabel = CreateLabel(hwnd, "Log", 0, 0, 10, 18);
+    g_hLogLabel = CreateWindowExA(
+        0, "STATIC", "Log", WS_CHILD | SS_LEFT,
+        0, 0, 10, 18, hwnd, NULL, NULL, NULL);
+    SendMessageA(g_hLogLabel, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+
     g_hLog = CreateWindowExA(
         0, "EDIT", "",
-        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+        WS_CHILD | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
         0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)IDC_LOG_EDIT, NULL, NULL);
     SendMessageA(g_hLog, WM_SETFONT, (WPARAM)g_hMonoFont, TRUE);
 
     LayoutControls(hwnd);
     UpdateRestoreButton(hwnd);
-    UiLog("[*] Ready.");
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -449,8 +648,63 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg)
     {
     case WM_CREATE:
+        g_hMainWindow = hwnd;
+        g_mainThreadId = GetCurrentThreadId();
         CreateControls(hwnd);
         ApplyAppTheme(hwnd);
+        return 0;
+
+    case WM_APP_LOG:
+    {
+        char* text = (char*)lParam;
+        if (text)
+        {
+            AppendLogText(text);
+            free(text);
+        }
+        return 0;
+    }
+
+    case WM_APP_WORKER_DONE:
+    {
+        BOOL isRestore = (BOOL)wParam;
+        BOOL success = (BOOL)lParam;
+
+        if (g_hWorkerThread)
+        {
+            CloseHandle(g_hWorkerThread);
+            g_hWorkerThread = NULL;
+        }
+
+        SetUiBusy(FALSE, isRestore);
+
+        if (!isRestore)
+        {
+            if (g_hPatchBtn)
+            {
+                SetWindowTextA(g_hPatchBtn, success ? "Patched" : "Patch");
+            }
+        }
+        else
+        {
+            if (g_hRestoreBtn)
+            {
+                SetWindowTextA(g_hRestoreBtn, "Restore");
+            }
+            if (g_hPatchBtn)
+            {
+                SetWindowTextA(g_hPatchBtn, "Patch");
+            }
+        }
+        UpdateRestoreButton(hwnd);
+        return 0;
+    }
+
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) != WA_INACTIVE && g_hWorkerThread == NULL)
+        {
+            UpdateRestoreButton(hwnd);
+        }
         return 0;
 
     case WM_ERASEBKGND:
@@ -466,24 +720,32 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_COMMAND:
         switch (LOWORD(wParam))
         {
-        case IDC_BROWSE_BTN:
-            BrowseForTarget(hwnd);
-            return 0;
         case IDC_PATCH_BTN:
             OnPatchClicked(hwnd);
             return 0;
         case IDC_RESTORE_BTN:
             OnRestoreClicked(hwnd);
             return 0;
-        case IDC_PATH_EDIT:
-            /* Re-evaluate whether the current path has a matching backup. */
-            if (HIWORD(wParam) == EN_CHANGE)
+        case IDC_SNI_EDIT:
+        case IDC_REGSNI_EDIT:
+            if (HIWORD(wParam) == EN_CHANGE && g_hPatchBtn && g_hWorkerThread == NULL)
             {
-                UpdateRestoreButton(hwnd);
+                SetWindowTextA(g_hPatchBtn, "Patch");
             }
             return 0;
         }
         break;
+
+    case WM_CLOSE:
+        if (g_hWorkerThread != NULL)
+        {
+            MessageBoxA(hwnd,
+                "An operation is currently in progress. Please wait until it completes before closing.",
+                "WARP SNI Patcher", MB_ICONWARNING | MB_OK);
+            return 0;
+        }
+        DestroyWindow(hwnd);
+        return 0;
 
     case WM_SIZE:
         LayoutControls(hwnd);
@@ -501,9 +763,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             /* Edit fields and the read-only log (which reports as STATIC) get
                the lighter field background; labels get the window background. */
             BOOL isField = (msg == WM_CTLCOLOREDIT) || ((HWND)lParam == g_hLog);
-            SetTextColor(hdc, DARK_TEXT);
+            if ((HWND)lParam == g_hHintLabel)
+            {
+                SetTextColor(hdc, RGB(0x9E, 0x9E, 0x9E));
+            }
+            else
+            {
+                SetTextColor(hdc, DARK_TEXT);
+            }
             SetBkColor(hdc, isField ? DARK_CTLBG : DARK_BG);
             return (LRESULT)(isField ? g_hCtlBrush : g_hWndBrush);
+        }
+        else if ((HWND)lParam == g_hHintLabel)
+        {
+            HDC hdc = (HDC)wParam;
+            SetTextColor(hdc, RGB(0x55, 0x55, 0x55));
+            SetBkMode(hdc, TRANSPARENT);
+            return (LRESULT)GetStockObject(NULL_BRUSH);
         }
         break;
 
@@ -518,12 +794,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_GETMINMAXINFO:
     {
         MINMAXINFO* mmi = (MINMAXINFO*)lParam;
-        mmi->ptMinTrackSize.x = UI_MIN_WIDTH;
-        mmi->ptMinTrackSize.y = UI_MIN_HEIGHT;
+        RECT rc = { 0, 0, UI_MIN_WIDTH, g_logVisible ? 345 : UI_COMPACT_CLIENT_H };
+        AdjustWindowRect(&rc, (DWORD)GetWindowLongPtrA(hwnd, GWL_STYLE), FALSE);
+        mmi->ptMinTrackSize.x = rc.right - rc.left;
+        mmi->ptMinTrackSize.y = rc.bottom - rc.top;
         return 0;
     }
 
     case WM_DESTROY:
+        if (g_hWorkerThread)
+        {
+            WaitForSingleObject(g_hWorkerThread, 5000);
+            CloseHandle(g_hWorkerThread);
+            g_hWorkerThread = NULL;
+        }
         if (g_hUiFont)
         {
             DeleteObject(g_hUiFont);
@@ -562,6 +846,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)hPrevInstance;
     (void)lpCmdLine;
 
+    g_mainThreadId = GetCurrentThreadId();
+
     {
         /* Opt into comctl32 v6 so buttons, scrollbars and the frame render
            with the modern (themed) visual style rather than classic chrome. */
@@ -592,9 +878,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
 
     {
-        /* Size the window so the client area is exactly 540 x 414. */
+        /* Size the window compactly on initial launch. */
         DWORD style = WS_OVERLAPPEDWINDOW;
-        RECT rc = { 0, 0, 540, 414 };
+        RECT rc = { 0, 0, 500, UI_COMPACT_CLIENT_H };
         int winW, winH, x, y;
         RECT work;
 
@@ -627,6 +913,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         MessageBoxA(NULL, "Failed to create window.", "WARP SNI Patcher", MB_ICONERROR);
         return 1;
     }
+
+    /* Allow lower-integrity processes (such as build scripts) to send WM_CLOSE through UIPI. */
+    ChangeWindowMessageFilterEx(hwnd, WM_CLOSE, 1 /* MSGFLT_ALLOW */, NULL);
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
