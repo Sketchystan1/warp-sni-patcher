@@ -148,7 +148,7 @@ jobs:
               if ($changelog -match $pattern) {
                   $notes = $matches[1].Trim()
                   Set-Content -Path $notesFile -Value $notes -Encoding utf8
-                  Write-Host "Extracted release notes for version $version:"
+                  Write-Host "Extracted release notes for version ${version}:"
                   Write-Host $notes
               } else {
                   Write-Host "No matching section found in CHANGELOG.md for version $version"
