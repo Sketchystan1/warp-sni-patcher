@@ -1,2 +1,8 @@
 *.exe
 *.exe.*
+build/
+.cache/
+downloads/
+__pycache__/
+*.pyc
+.venv/
