@@ -1,23 +1,30 @@
 /*
- * WARP SNI Patcher -- Win32 GUI.
- *
- * This translation unit owns the window, the controls, and WinMain. It drives
- * the on-disk patching through the core functions declared in the shared
- * header, and provides UiLog() so the core can report progress into the log box.
- *
- * The process runs elevated by default (requireAdministrator manifest embedded
- * at link time) because warp-svc.exe lives under Program Files.
+ * WARP SNI Patcher - Win32 GUI Implementation
  */
 
-#include "patcher.h"
+#include "gui.h"
+#include "../patcher.h"
+#include "../service.h"
+#include "../i18n.h"
+
+#ifdef _WIN32
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
+#include <shellapi.h>
 #include <stdio.h>
-#include <stdarg.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* Common-Controls v6 gives buttons, scrollbars and edits the modern themed
    look. The manifest dependency is merged into the linker-embedded manifest;
@@ -27,6 +34,8 @@
     "\"/manifestdependency:type='win32' " \
     "name='Microsoft.Windows.Common-Controls' version='6.0.0.0' " \
     "processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+
+static std::string g_target = DEFAULT_TARGET_PATH;
 
 /* Control IDs */
 #define IDC_SNI_EDIT     1001
@@ -352,41 +361,15 @@ static void AppendLogText(const char* line)
     }
 }
 
-/* Append a formatted line to the GUI log control (CRLF-terminated). */
-void UiLog(const char* fmt, ...)
-{
-    char line[1024];
-    va_list args;
-    int n;
-
-    va_start(args, fmt);
-    n = _vsnprintf(line, sizeof(line) - 3, fmt, args);
-    va_end(args);
-    if (n < 0)
-    {
-        n = (int)sizeof(line) - 3;
-    }
-    line[n] = '\r';
-    line[n + 1] = '\n';
-    line[n + 2] = '\0';
-
-    if (g_hMainWindow)
-    {
-        if (g_mainThreadId != 0 && GetCurrentThreadId() == g_mainThreadId)
-        {
-            AppendLogText(line);
-        }
-        else
-        {
-            char* copy = _strdup(line);
-            if (copy)
-            {
-                if (!PostMessageW(g_hMainWindow, WM_APP_LOG, 0, (LPARAM)copy))
-                {
-                    free(copy);
-                }
-            }
-        }
+// All backends use the same logger; marshal GUI updates to the UI thread.
+static void GuiLog(const char* text, void*) {
+    std::string line = TranslateLogMessage(text);
+    line += "\r\n";
+    if (GetCurrentThreadId() == g_mainThreadId) {
+        AppendLogText(line.c_str());
+    } else {
+        char* copy = _strdup(line.c_str());
+        if (copy && !PostMessageW(g_hMainWindow, WM_APP_LOG, 0, (LPARAM)copy)) free(copy);
     }
 }
 
@@ -428,7 +411,7 @@ static void UpdateRestoreButton(HWND hwnd)
     (void)hwnd;
     if (g_hRestoreBtn)
     {
-        BuildBackupPath(DEFAULT_TARGET_PATH, backup, sizeof(backup));
+        BuildBackupPath(g_target.c_str(), backup, sizeof(backup));
         show = FileExists(backup);
         ShowWindow(g_hRestoreBtn, show ? SW_SHOW : SW_HIDE);
     }
@@ -473,63 +456,14 @@ static void SetUiBusy(BOOL busy, BOOL isRestore)
     }
 }
 
-static DWORD WINAPI PatchWorkerThread(LPVOID lpParam)
-{
-    WORKER_PARAMS* p = (WORKER_PARAMS*)lpParam;
-    BOOL success = FALSE;
-
-    if (!p->isRestore)
-    {
-        BOOL wasRunning = FALSE;
-
-        WarpDisconnectIfConnected(p->target, NULL);
-
-        if (!StopWarpService(&wasRunning))
-        {
-            UiLog("%s", Tr(STR_LOG_ERR_STOP_SERVICE_ADMIN));
-            goto finish;
-        }
-
-        RemoveSideloadedUserenv(p->target);
-
-        success = RunPatch(p->target, p->sni, p->regSni);
-
-        StartWarpService();
-
-        if (success)
-        {
-            UiLog("%s", Tr(STR_LOG_DONE));
-        }
-        else
-        {
-            UiLog("%s", Tr(STR_LOG_ERR_PATCH_FAILED));
-        }
-    }
-    else
-    {
-        BOOL wasRunning = FALSE;
-
-        if (!StopWarpService(&wasRunning))
-        {
-            UiLog("%s", Tr(STR_LOG_ERR_STOP_SERVICE_ADMIN));
-            goto finish;
-        }
-
-        success = RunRestore(p->target);
-
-        StartWarpService();
-
-        if (success)
-        {
-            UiLog("%s", Tr(STR_LOG_DONE));
-        }
-        else
-        {
-            UiLog("%s", Tr(STR_LOG_ERR_RESTORE_FAILED));
-        }
-    }
-
-finish:
+static DWORD WINAPI PatchWorkerThread(LPVOID lpParam) {
+    WORKER_PARAMS* p = static_cast<WORKER_PARAMS*>(lpParam);
+    warp::PatchOptions options;
+    options.target_path = p->target;
+    if (p->sni[0]) options.masque_host = p->sni;
+    if (p->regSni[0]) options.reg_api_host = p->regSni;
+    const bool success = warp::RunOperation(options, p->isRestore != FALSE);
+    if (!success) UiLog("%s", Tr(p->isRestore ? STR_LOG_ERR_RESTORE_FAILED : STR_LOG_ERR_PATCH_FAILED));
     PostMessageW(g_hMainWindow, WM_APP_WORKER_DONE, (WPARAM)p->isRestore, (LPARAM)success);
     free(p);
     return 0;
@@ -542,7 +476,7 @@ static void OnPatchClicked(HWND hwnd)
         return;
     }
 
-    const char* target = DEFAULT_TARGET_PATH;
+    const char* target = g_target.c_str();
     char sni[256];
     char regSni[256];
     WORKER_PARAMS* p;
@@ -599,7 +533,7 @@ static void OnRestoreClicked(HWND hwnd)
         return;
     }
 
-    const char* target = DEFAULT_TARGET_PATH;
+    const char* target = g_target.c_str();
     char backup[MAX_PATH * 2];
     WORKER_PARAMS* p;
 
@@ -1062,17 +996,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
-                   LPSTR lpCmdLine, int nCmdShow)
+int RunGui(HINSTANCE hInstance, int nCmdShow, int argc, char** argv)
 {
     WNDCLASSEXW wc;
     HWND hwnd;
-    MSG msg;
+    MSG msg{};
     const wchar_t* className = L"WarpSniPatcherWindow";
+    int i;
 
-    (void)hPrevInstance;
 
-    I18nInit(lpCmdLine);
+    I18nInit(NULL);
+    for (i = 1; i < argc; ++i)
+    {
+        if (_stricmp(argv[i], "--ru") == 0) I18nSetRussian(TRUE);
+        else if (_stricmp(argv[i], "--en") == 0) I18nSetRussian(FALSE);
+        else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) g_target = argv[++i];
+    }
 
     g_mainThreadId = GetCurrentThreadId();
 
@@ -1154,9 +1093,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         }
     }
 
-    /* Allow lower-integrity processes (such as build scripts) to send WM_CLOSE through UIPI. */
-    ChangeWindowMessageFilterEx(hwnd, WM_CLOSE, 1 /* MSGFLT_ALLOW */, NULL);
-
+    for (i = 1; i + 1 < argc; ++i) {
+        if (strcmp(argv[i], "--sni") == 0) SetWindowTextA(g_hSniEdit, argv[++i]);
+        else if (strcmp(argv[i], "--reg-api") == 0) SetWindowTextA(g_hRegSniEdit, argv[++i]);
+    }
+    warp::SetLogCallback(GuiLog, nullptr);
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
@@ -1169,5 +1110,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         }
     }
 
+    warp::SetLogCallback(nullptr, nullptr);
     return (int)msg.wParam;
 }
+
+
+
+
+namespace warp {
+int RunGui(int argc, char** argv) {
+    return ::RunGui(GetModuleHandle(NULL), SW_SHOWDEFAULT, argc, argv);
+}
+}
+
+
+
+
+#endif // _WIN32

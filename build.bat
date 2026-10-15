@@ -1,111 +1,19 @@
 @echo off
-setlocal EnableExtensions
+setlocal
+cd /d "%~dp0"
 
-for /F "tokens=1,2 delims=#" %%a in ('"prompt #$H#$E# & echo on & for %%b in (1) do rem"') do set "ESC=%%b"
-set "RED=%ESC%[91m"
-set "GREEN=%ESC%[92m"
-set "YELLOW=%ESC%[93m"
-set "RESET=%ESC%[0m"
-
-set "NO_PAUSE=0"
-if /I "%~1"=="--no-pause" set "NO_PAUSE=1"
-if /I "%~1"=="-nopause" set "NO_PAUSE=1"
-if /I "%~1"=="--batch" set "NO_PAUSE=1"
-if defined CI set "NO_PAUSE=1"
-
-:: This script lives next to the source files; everything is built in place.
-set "PATCHER_DIR=%~dp0"
-set "PATCHER_EXE=%PATCHER_DIR%warp-sni-patcher.exe"
-set "SOURCES=patcher.c ui.c i18n.c"
-
-:: Auto-close warp-sni-patcher.exe if currently running so the binary is not locked.
-tasklist /FI "IMAGENAME eq warp-sni-patcher.exe" 2>nul | findstr /I /C:"warp-sni-patcher.exe" >nul
-if not errorlevel 1 (
-    echo %YELLOW%Closing running instance of warp-sni-patcher.exe...%RESET%
-    taskkill /F /IM warp-sni-patcher.exe >nul 2>&1
-    tasklist /FI "IMAGENAME eq warp-sni-patcher.exe" 2>nul | findstr /I /C:"warp-sni-patcher.exe" >nul
-    if not errorlevel 1 (
-        powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-Process warp-sni-patcher -ErrorAction SilentlyContinue; if ($p) { $p.CloseMainWindow() | Out-Null; Start-Sleep -Milliseconds 400 }; if (Get-Process warp-sni-patcher -ErrorAction SilentlyContinue) { Start-Process taskkill -ArgumentList '/F /IM warp-sni-patcher.exe' -Verb RunAs -Wait -WindowStyle Hidden }" >nul 2>&1
-    )
-    timeout /t 1 /nobreak >nul 2>&1
-)
-(call )
-
-:: Ensure MSVC compiler is available
-where cl.exe >nul 2>&1
-if not errorlevel 1 goto :compiler_ready
-
-set "VCVARS="
+where cmake >nul 2>&1
+if not errorlevel 1 goto :build
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-if exist "%VSWHERE%" (
-    for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
-        if exist "%%i\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=%%i\VC\Auxiliary\Build\vcvarsall.bat"
-    )
-    if not defined VCVARS (
-        for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -property installationPath`) do (
-            if exist "%%i\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=%%i\VC\Auxiliary\Build\vcvarsall.bat"
-        )
-    )
-)
+if not exist "%VSWHERE%" goto :missing
+for /f "usebackq delims=" %%V in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%V\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul
+where cmake >nul 2>&1
+if errorlevel 1 goto :missing
 
-if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat"
-if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat"
-if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
-if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat"
-if not defined VCVARS if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvarsall.bat"
-if not defined VCVARS if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat"
+:build
+python scripts\build_all.py %*
+exit /b %errorlevel%
 
-if not defined VCVARS (
-    echo %RED%[!] Visual Studio C++ build tools not found.%RESET%
-    goto :error
-)
-
-echo %YELLOW%Initializing MSVC environment...%RESET%
-call "%VCVARS%" amd64 >nul 2>&1
-
-:compiler_ready
-echo %YELLOW%Building patcher...%RESET%
-pushd "%PATCHER_DIR%"
-
-:: Generate the application icon (app.ico) from app-icon.png if missing,
-:: then compile the resource script that embeds it into the executable.
-if not exist "%PATCHER_DIR%app.ico" (
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%PATCHER_DIR%make-icon.ps1"
-    if errorlevel 1 goto :error
-)
-rc.exe /nologo /fo "%PATCHER_DIR%app.res" "%PATCHER_DIR%app.rc"
-if errorlevel 1 goto :error
-
-:: /SUBSYSTEM:WINDOWS for a GUI app; the linker embeds the requireAdministrator
-:: manifest so the patcher always launches elevated. Objects land next to the
-:: sources and are cleaned up below.
-cl.exe /nologo /utf-8 /W3 /O2 /DNDEBUG /DWIN32 /D_WINDOWS /D_CRT_SECURE_NO_WARNINGS /MT ^
-    /Fe"%PATCHER_EXE%" %SOURCES% ^
-    /link /INCREMENTAL:NO /RELEASE /SUBSYSTEM:WINDOWS app.res ^
-    /MANIFEST:EMBED /MANIFESTUAC:"level='requireAdministrator' uiAccess='false'" ^
-    kernel32.lib user32.lib gdi32.lib comdlg32.lib advapi32.lib comctl32.lib dwmapi.lib uxtheme.lib
-if errorlevel 1 goto :error
-
-del /Q "%PATCHER_DIR%*.obj" "%PATCHER_DIR%*.exp" "%PATCHER_DIR%*.lib" "%PATCHER_DIR%*.res" 2>nul
-
-echo %GREEN%[+] Patcher built: .\warp-sni-patcher.exe%RESET%
-popd
-if "%NO_PAUSE%"=="0" (
-    echo.
-    echo Press any key to close . . .
-    pause >nul
-)
-endlocal
-exit /b 0
-
-:error
-echo %RED%[!] Patcher build failed%RESET%
-del /Q "%PATCHER_DIR%*.obj" "%PATCHER_DIR%*.exp" "%PATCHER_DIR%*.lib" "%PATCHER_DIR%*.res" 2>nul
-popd
-if "%NO_PAUSE%"=="0" (
-    echo.
-    echo Press any key to close . . .
-    pause >nul
-)
-endlocal
+:missing
+echo Install Visual Studio C++ build tools with CMake, or add CMake to PATH.
 exit /b 1

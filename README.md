@@ -1,26 +1,22 @@
 # WARP SNI Patcher
 
-A small tool that patches Cloudflare WARP's `warp-svc.exe` on disk to override the MASQUE tunnel SNI and the registration API hostname.
+Change Cloudflare WARP's SNI and registration hostnames on Windows, Linux, and macOS.
 
-## How it works
+## Use
 
-The patcher parses `warp-svc.exe` as a PE image, and for each known hostname it:
+1. Install Cloudflare WARP.
+2. Download the package for your system from [Releases](https://github.com/Sketchystan1/warp-sni-patcher/releases/latest) and extract it.
+3. Start the patcher:
 
-1. Overwrites the hostname string in place with the new value (same address, so no pointer repointing needed).
-2. Fixes the associated length values — fat-pointer length fields in data, `mov r32, imm32` immediates near the `lea` that loads the hostname, and (registration host only) the parallel ptr/len arrays `warp-svc` indexes at runtime.
+   - **Windows:** open `warp-sni-patcher.exe` and allow administrator access.
+   - **Linux/macOS:** open a terminal in the extracted folder and run `sudo ./warp-sni-patcher --gui`.
 
-MASQUE hostnames are packed string-table literals, so the replacement must fit the original length; the tail is left untouched (Rust `&str` is `(ptr, len)` with no NUL terminator, so the patched length bounds every read). Registration hosts sit in fixed 32-byte slots, so the replacement may be longer, up to the slot capacity.
+4. Enter the hostnames you want to use and click **Patch**. On macOS, follow the steps below before and after patching.
 
-The original binary is preserved as `<target>.bak`, refreshed whenever the target is still pristine, so re-running after a WARP update stays clean. Patching breaks the Authenticode signature.
+Click **Restore** to undo the patch. Keep the `.bak` backup file; Restore needs it. WARP updates may undo the patch.
 
-## Releases
+**macOS:** Before Patch or Restore, run `warp-cli registration delete`. Afterward, run `warp-cli registration new`, or sign in again for Zero Trust. Use WARP's default tunnel mode; PacketTunnel is not supported. macOS with SIP on has not been tested.
 
-Pre-built release packages (`.zip`) are available on the [Releases](https://github.com/Sketchystan1/warp-sni-patcher/releases) page. See [CHANGELOG.md](CHANGELOG.md) for details on each release.
+**Linux:** Needs an X11/XWayland desktop and system libraries compatible with Ubuntu 22.04.
 
-## Building from source
-
-Requires Visual Studio with C++ desktop development tools (MSVC x64). Run:
-
-```cmd
-build.bat
-```
+For command-line help, run `./warp-sni-patcher --help`.
