@@ -83,7 +83,7 @@ jobs:
           python-version: '3.12'
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libfltk1.3-dev xvfb xdotool
+        run: sudo apt-get update && sudo apt-get install -y libfltk1.3-dev libxcursor-dev libxfixes-dev libxft-dev libxinerama-dev xvfb xdotool
       - name: Build and test universal macOS package
         if: runner.os == 'macOS'
         run: python scripts/build_all.py --macos

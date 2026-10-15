@@ -19,7 +19,7 @@ On macOS, run `warp-cli registration delete` **before Patch or Restore**, then r
 Run `build.bat` on Windows. Requirements:
 
 - Windows: Visual Studio C++ tools, CMake, Python 3.12+.
-- WSL: CMake, Make, g++, Python 3.12+, FLTK development files.
+- WSL: CMake, Make, g++, Python 3.12+, FLTK/X11 development packages listed in the [workflow](.github/workflows/build.yml).
 - OSXCross in WSL with an Apple SDK and both Intel/ARM64 toolchains.
 
 After a successful build, `build/` contains only the Windows ZIP, Linux TAR.GZ, and universal macOS ZIP. Other contents are removed. Build caches stay outside `build/`; Python utilities live in [scripts/](scripts/). Local Linux builds inherit the build system's library requirements.
