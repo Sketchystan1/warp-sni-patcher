@@ -1,10 +1,117 @@
-/*
- * WARP SNI Patcher -- Internationalization (i18n) implementation.
- */
+#pragma once
 
-#include "i18n.h"
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <wchar.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#elif defined(__APPLE__) || defined(__OBJC__)
+#include <objc/objc.h>
+#ifndef TRUE
+#define TRUE YES
+#endif
+#ifndef FALSE
+#define FALSE NO
+#endif
+#else
+#include <strings.h>
+#ifndef TRUE
+#define TRUE 1
+#endif
+#ifndef FALSE
+#define FALSE 0
+#endif
+typedef int BOOL;
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+    /* UI Strings */
+    STR_APP_TITLE,
+    STR_TIP_HINT,
+    STR_MASQUE_SNI_LABEL,
+    STR_REG_SNI_LABEL,
+    STR_RESTORE_BTN,
+    STR_PATCH_BTN,
+    STR_LOG_LABEL,
+    STR_STATUS_PATCHING,
+    STR_STATUS_RESTORING,
+    STR_STATUS_PATCHED,
+    STR_MSG_OP_IN_PROGRESS,
+    STR_ERR_REGISTER_CLASS,
+    STR_ERR_CREATE_WINDOW,
+
+    /* Logging / Status Strings */
+    STR_LOG_STOP_SERVICE,
+    STR_LOG_START_SERVICE,
+    STR_LOG_CLEANING_USERENV,
+    STR_LOG_CLEANED_USERENV,
+    STR_LOG_DISCONNECTING,
+    STR_LOG_RECONNECT_NOTE,
+    STR_LOG_BACKUP,
+    STR_LOG_PATCHING,
+    STR_LOG_DONE,
+    STR_LOG_RESTORED_OK,
+
+    /* Warnings / Errors */
+    STR_LOG_ERR_STOP_SERVICE_ADMIN,
+    STR_LOG_ERR_STOP_SERVICE,
+    STR_LOG_ERR_STOP_TIMEOUT,
+    STR_LOG_ERR_START_SERVICE,
+    STR_LOG_ERR_OPEN_SERVICE_START,
+    STR_LOG_ERR_START_TIMEOUT,
+    STR_LOG_ERR_SCM_ADMIN,
+    STR_LOG_ERR_ACCESS_SERVICE,
+    STR_LOG_ERR_CHECK_SERVICE_STATUS,
+    STR_LOG_ERR_DELETE_USERENV,
+    STR_LOG_ERR_PATCH_FAILED,
+    STR_LOG_ERR_RESTORE_FAILED,
+    STR_LOG_ERR_NO_BACKUP,
+    STR_LOG_ERR_BACKUP_DIFF_VER,
+    STR_LOG_ERR_CURRENT_UNPATCHED,
+    STR_LOG_ERR_DELETE_BACKUP_FRESH,
+    STR_LOG_ERR_BACKUP_NO_ORIG_HOSTS,
+    STR_LOG_ERR_BACKUP_UNSUPPORTED,
+    STR_LOG_ERR_TARGET_NOT_FOUND,
+    STR_LOG_ERR_CHECK_INSTALL,
+    STR_LOG_ERR_MEM_ALLOC,
+    STR_LOG_ERR_THREAD_CREATE,
+    STR_LOG_ERR_OPEN_FILE,
+    STR_LOG_ERR_INVALID_SIZE,
+    STR_LOG_ERR_NOT_ENOUGH_MEM,
+    STR_LOG_ERR_READ_FILE,
+    STR_LOG_ERR_SAVE_CHANGES_ADMIN,
+    STR_LOG_ERR_WRITE_FILE,
+    STR_LOG_ERR_FILE_TOO_SMALL,
+    STR_LOG_ERR_NOT_VALID_PE,
+    STR_LOG_ERR_PE_HEADER_INVALID,
+    STR_LOG_ERR_X64_ONLY,
+    STR_LOG_ERR_EMPTY_SNI,
+    STR_LOG_ERR_SNI_TOO_LONG,
+    STR_LOG_TIP_DEFAULT_SNI,
+    STR_LOG_ERR_EMPTY_REG_SNI,
+    STR_LOG_ERR_REG_SNI_TOO_LONG,
+    STR_LOG_TIP_DEFAULT_REG_SNI,
+    STR_LOG_ERR_FIND_WARP_SVC,
+    STR_LOG_ERR_VERIFY_PATH,
+    STR_LOG_ERR_NO_ORIG_HOSTS_AND_NO_BACKUP,
+    STR_LOG_ERR_ALREADY_PATCHED_OR_UNSUPPORTED,
+    STR_LOG_ERR_REG_HOSTNAME_TOO_LONG,
+    STR_LOG_ERR_REG_UPDATE_UNSAFE,
+
+    STR_COUNT
+} StringId;
 
 typedef struct {
     const char* en;
@@ -13,18 +120,17 @@ typedef struct {
     const wchar_t* ruW;
 } I18N_ENTRY;
 
-#define ENTRY(id, enStr, ruStr) \
-    [id] = { enStr, ruStr, L##enStr, L##ruStr }
+#define ENTRY(id, enStr, ruStr) { enStr, ruStr, L##enStr, L##ruStr }
 
-static const I18N_ENTRY g_table[STR_COUNT] = {
+inline const I18N_ENTRY g_table[STR_COUNT] = {
     /* UI Strings */
     ENTRY(STR_APP_TITLE,
         "WARP SNI Patcher",
         "WARP SNI Patcher"),
 
     ENTRY(STR_TIP_HINT,
-        "Replaces blocked WARP hostnames to restore connection.\r\nPre-filled hosts are recommended. Just click Patch.",
-        "Заменяет заблокированные имена хостов WARP для восстановления подключения. Рекомендуется использовать уже заполненные значения. Просто нажмите «Пропатчить»."),
+        "Replaces blocked WARP hostnames to restore connection.\nPre-filled hosts are recommended. Just click Patch.",
+        "Заменяет заблокированные имена хостов WARP для восстановления подключения.\nРекомендуется использовать уже заполненные значения. Просто нажмите «Пропатчить»."),
 
     ENTRY(STR_MASQUE_SNI_LABEL,
         "New MASQUE SNI hostname",
@@ -289,10 +395,12 @@ static const I18N_ENTRY g_table[STR_COUNT] = {
         "[!] Не удалось безопасно обновить имя хоста регистрации в этой версии WARP.")
 };
 
-static BOOL g_initialized = FALSE;
-static BOOL g_isRussian = FALSE;
+#undef ENTRY
 
-static BOOL DetectRussianLanguage(const char* cmdLine)
+inline BOOL g_i18n_initialized = FALSE;
+inline BOOL g_i18n_isRussian = FALSE;
+
+inline BOOL DetectRussianLanguage(const char* cmdLine)
 {
     /* 1. Explicit command line overrides */
     if (cmdLine)
@@ -312,6 +420,7 @@ static BOOL DetectRussianLanguage(const char* cmdLine)
     }
 
     /* 2. Environment variable overrides */
+#ifdef _WIN32
     {
         char envLang[32];
         DWORD len = GetEnvironmentVariableA("WARP_PATCHER_LANG", envLang, sizeof(envLang));
@@ -357,43 +466,56 @@ static BOOL DetectRussianLanguage(const char* cmdLine)
     if (PRIMARYLANGID(GetSystemDefaultUILanguage()) == LANG_RUSSIAN) return TRUE;
     if (PRIMARYLANGID(GetUserDefaultLangID()) == LANG_RUSSIAN) return TRUE;
     if (PRIMARYLANGID(GetSystemDefaultLangID()) == LANG_RUSSIAN) return TRUE;
+#else
+    {
+        const char* names[] = { "WARP_PATCHER_LANG", "LC_ALL", "LC_MESSAGES", "LANG" };
+        size_t i;
+        for (i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+        {
+            const char* language = getenv(names[i]);
+            if (!language || !*language) continue;
+            if (strncasecmp(language, "ru", 2) == 0) return TRUE;
+            return FALSE;
+        }
+    }
+#endif
 
     return FALSE;
 }
 
-void I18nInit(const char* cmdLine)
+inline void I18nInit(const char* cmdLine)
 {
-    g_isRussian = DetectRussianLanguage(cmdLine);
-    g_initialized = TRUE;
+    g_i18n_isRussian = DetectRussianLanguage(cmdLine);
+    g_i18n_initialized = TRUE;
 }
 
-BOOL I18nIsRussian(void)
+inline BOOL I18nIsRussian(void)
 {
-    if (!g_initialized)
+    if (!g_i18n_initialized)
     {
         I18nInit(NULL);
     }
-    return g_isRussian;
+    return g_i18n_isRussian;
 }
 
-void I18nSetRussian(BOOL isRussian)
+inline void I18nSetRussian(BOOL isRussian)
 {
-    g_isRussian = isRussian;
-    g_initialized = TRUE;
+    g_i18n_isRussian = isRussian;
+    g_i18n_initialized = TRUE;
 }
 
-void I18nToggleLanguage(void)
+inline void I18nToggleLanguage(void)
 {
-    if (!g_initialized)
+    if (!g_i18n_initialized)
     {
         I18nInit(NULL);
     }
-    g_isRussian = !g_isRussian;
+    g_i18n_isRussian = !g_i18n_isRussian;
 }
 
-const char* Tr(StringId id)
+inline const char* Tr(StringId id)
 {
-    if (!g_initialized)
+    if (!g_i18n_initialized)
     {
         I18nInit(NULL);
     }
@@ -401,12 +523,12 @@ const char* Tr(StringId id)
     {
         return "";
     }
-    return g_isRussian ? g_table[id].ru : g_table[id].en;
+    return g_i18n_isRussian ? g_table[id].ru : g_table[id].en;
 }
 
-const wchar_t* TrW(StringId id)
+inline const wchar_t* TrW(StringId id)
 {
-    if (!g_initialized)
+    if (!g_i18n_initialized)
     {
         I18nInit(NULL);
     }
@@ -414,5 +536,69 @@ const wchar_t* TrW(StringId id)
     {
         return L"";
     }
-    return g_isRussian ? g_table[id].ruW : g_table[id].enW;
+    return g_i18n_isRussian ? g_table[id].ruW : g_table[id].enW;
 }
+
+#ifdef __cplusplus
+}
+#endif
+
+#ifdef __cplusplus
+#include <string>
+
+inline std::string TranslateLogMessage(const std::string& msg) {
+    if (!I18nIsRussian()) {
+        return msg;
+    }
+
+    std::string s = msg;
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) {
+        s.pop_back();
+    }
+
+    if (s == "Stopping Cloudflare WARP service..." || s == "Stop service..." || s == "Stopping Cloudflare WARP daemon...") {
+        return Tr(STR_LOG_STOP_SERVICE);
+    }
+    if (s == "Starting Cloudflare WARP service..." || s == "Start service..." || s == "Starting Cloudflare WARP daemon...") {
+        return Tr(STR_LOG_START_SERVICE);
+    }
+    if (s == "Disconnecting Cloudflare WARP tunnel..." || s == "Disconnecting...") {
+        return Tr(STR_LOG_DISCONNECTING);
+    }
+    if (s == "Reconnecting Cloudflare WARP tunnel..." || s == "Reconnecting...") {
+        return "Повторное подключение туннеля...";
+    }
+    if (s == "Backup...") {
+        return Tr(STR_LOG_BACKUP);
+    }
+    if (s == "Patching...") {
+        return Tr(STR_LOG_PATCHING);
+    }
+    if (s == "Done!") {
+        return Tr(STR_LOG_DONE);
+    }
+    if (s == "Original file restored from backup.") {
+        return Tr(STR_LOG_RESTORED_OK);
+    }
+    if (s.rfind("[!] Could not write to: ", 0) == 0) {
+        return "[!] Не удалось записать в: " + s.substr(24);
+    }
+    if (s.rfind("[!] Backup file not found: ", 0) == 0) {
+        return "[!] Файл резервной копии не найден: " + s.substr(27);
+    }
+    if (s.rfind("[!] Could not open target: ", 0) == 0) {
+        return "[!] Не удалось открыть целевой файл: " + s.substr(27);
+    }
+    if (s.rfind("[!] Could not stop WARP service.", 0) == 0) {
+        return Tr(STR_LOG_ERR_STOP_SERVICE_ADMIN);
+    }
+    if (s.rfind("[!] Restore failed: ", 0) == 0) {
+        return "[!] Ошибка восстановления: " + s.substr(20);
+    }
+    if (s.rfind("Note: You can reconnect", 0) == 0) {
+        return Tr(STR_LOG_RECONNECT_NOTE);
+    }
+
+    return msg;
+}
+#endif

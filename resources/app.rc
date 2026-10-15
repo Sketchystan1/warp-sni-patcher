@@ -1,0 +1,36 @@
+/* Application resources. The icon is embedded so Explorer, the taskbar and
+   Alt-Tab show the app's own icon (a runtime WM_SETICON only affects the
+   window frame). */
+#include <windows.h>
+#include "version.h"
+
+/* Numerically lowest ID => this is the icon Explorer uses for the .exe file. */
+#define IDI_APPICON 1
+
+IDI_APPICON ICON "app.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION APP_VERSION_NUM
+ PRODUCTVERSION APP_VERSION_NUM
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "WARP SNI Patcher"
+            VALUE "FileVersion", APP_VERSION_STR
+            VALUE "InternalName", "warp-sni-patcher"
+            VALUE "OriginalFilename", "warp-sni-patcher.exe"
+            VALUE "ProductName", "WARP SNI Patcher"
+            VALUE "ProductVersion", APP_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

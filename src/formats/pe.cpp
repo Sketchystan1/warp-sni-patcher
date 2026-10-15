@@ -1,3 +1,23 @@
+#include "formats.h"
+#include "../patcher.h"
+#include "../service.h"
+
+#include <stdexcept>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _WIN32
 /*
  * WARP SNI Patcher -- core (PE parsing, in-place patching, service control).
  *
@@ -30,11 +50,7 @@
  * replace the binary, so the patcher must be re-run after each update.
  */
 
-#include "patcher.h"
-#include <ctype.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+
 
 #define BACKUP_SUFFIX ".bak"
 #define RIP_RELATIVE_LEA_SIZE 7
@@ -119,14 +135,14 @@ static unsigned char* ReadWholeFile(const char* path, size_t* outSize)
         NULL);
     if (file == INVALID_HANDLE_VALUE)
     {
-        UiLog(Tr(STR_LOG_ERR_OPEN_FILE), path);
+        UiLog("[!] Unable to open '%s'. Please check that the file exists and is accessible.", path);
         return NULL;
     }
 
     if (!GetFileSizeEx(file, &fileSize) || fileSize.QuadPart <= 0 ||
         fileSize.QuadPart > (LONGLONG)0x7FFFFFFF)
     {
-        UiLog(Tr(STR_LOG_ERR_INVALID_SIZE), path);
+        UiLog("[!] The file '%s' has an invalid size.", path);
         CloseHandle(file);
         return NULL;
     }
@@ -134,7 +150,7 @@ static unsigned char* ReadWholeFile(const char* path, size_t* outSize)
     buffer = (unsigned char*)malloc((size_t)fileSize.QuadPart);
     if (!buffer)
     {
-        UiLog(Tr(STR_LOG_ERR_NOT_ENOUGH_MEM), path);
+        UiLog("[!] Not enough memory to read '%s'.", path);
         CloseHandle(file);
         return NULL;
     }
@@ -146,7 +162,7 @@ static unsigned char* ReadWholeFile(const char* path, size_t* outSize)
         if (!ReadFile(file, buffer + readTotal, toRead - readTotal, &chunk, NULL) ||
             chunk == 0)
         {
-            UiLog(Tr(STR_LOG_ERR_READ_FILE), path);
+            UiLog("[!] Could not read '%s'.", path);
             free(buffer);
             CloseHandle(file);
             return NULL;
@@ -159,7 +175,7 @@ static unsigned char* ReadWholeFile(const char* path, size_t* outSize)
     return buffer;
 }
 
-static BOOL WriteWholeFile(const char* path, const unsigned char* data, size_t size)
+static BOOL WriteWholeFileEx(const char* path, const unsigned char* data, size_t size, BOOL createNew)
 {
     HANDLE file;
     DWORD written = 0;
@@ -170,22 +186,23 @@ static BOOL WriteWholeFile(const char* path, const unsigned char* data, size_t s
         GENERIC_WRITE,
         0,
         NULL,
-        CREATE_ALWAYS,
+        createNew ? CREATE_NEW : CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL,
         NULL);
     if (file == INVALID_HANDLE_VALUE)
     {
-        UiLog(Tr(STR_LOG_ERR_SAVE_CHANGES_ADMIN), path);
+        UiLog("[!] Unable to save changes to '%s'. Please ensure the app is running as Administrator.", path);
         return FALSE;
     }
 
     while (total < size)
     {
         DWORD chunk = (size - total > 0x10000000) ? 0x10000000 : (DWORD)(size - total);
-        if (!WriteFile(file, data + total, chunk, &written, NULL))
+        if (!WriteFile(file, data + total, chunk, &written, NULL) || written == 0)
         {
-            UiLog(Tr(STR_LOG_ERR_WRITE_FILE), path);
+            UiLog("[!] Could not write to '%s'. Please check available disk space and permissions.", path);
             CloseHandle(file);
+            if (createNew) DeleteFileA(path);
             return FALSE;
         }
         total += written;
@@ -193,6 +210,11 @@ static BOOL WriteWholeFile(const char* path, const unsigned char* data, size_t s
 
     CloseHandle(file);
     return TRUE;
+}
+
+static BOOL WriteWholeFile(const char* path, const unsigned char* data, size_t size)
+{
+    return WriteWholeFileEx(path, data, size, FALSE);
 }
 
 BOOL FileExists(const char* path)
@@ -222,34 +244,35 @@ static BOOL ParsePe(unsigned char* base, size_t size, PE_VIEW* view)
 
     if (size < sizeof(IMAGE_DOS_HEADER))
     {
-        UiLog("%s", Tr(STR_LOG_ERR_FILE_TOO_SMALL));
+        UiLog("%s", "[!] The selected file is too small to be a valid executable.");
         return FALSE;
     }
 
     dos = (IMAGE_DOS_HEADER*)base;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE)
     {
-        UiLog("%s", Tr(STR_LOG_ERR_NOT_VALID_PE));
+        UiLog("%s", "[!] The selected file is not a valid Windows executable.");
         return FALSE;
     }
 
-    if ((size_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > size)
+    if (dos->e_lfanew < 0 || (size_t)dos->e_lfanew > size ||
+        size - (size_t)dos->e_lfanew < sizeof(IMAGE_NT_HEADERS64))
     {
-        UiLog("%s", Tr(STR_LOG_ERR_PE_HEADER_INVALID));
+        UiLog("%s", "[!] The executable file header is invalid.");
         return FALSE;
     }
 
     nt = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE)
     {
-        UiLog("%s", Tr(STR_LOG_ERR_NOT_VALID_PE));
+        UiLog("%s", "[!] The selected file is not a valid Windows executable.");
         return FALSE;
     }
 
     if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
         nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
     {
-        UiLog("%s", Tr(STR_LOG_ERR_X64_ONLY));
+        UiLog("%s", "[!] Only 64-bit (x64) versions of Cloudflare WARP are supported.");
         return FALSE;
     }
 
@@ -259,6 +282,26 @@ static BOOL ParsePe(unsigned char* base, size_t size, PE_VIEW* view)
     view->sections = IMAGE_FIRST_SECTION(nt);
     view->sectionCount = nt->FileHeader.NumberOfSections;
     view->imageBase = nt->OptionalHeader.ImageBase;
+    {
+        size_t sectionOffset = (size_t)dos->e_lfanew + sizeof(DWORD) +
+            sizeof(IMAGE_FILE_HEADER) + nt->FileHeader.SizeOfOptionalHeader;
+        WORD i;
+        if (nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64) ||
+            sectionOffset > size || view->sectionCount > (size - sectionOffset) / sizeof(IMAGE_SECTION_HEADER))
+        {
+            UiLog("%s", "[!] The executable file header is invalid.");
+            return FALSE;
+        }
+        for (i = 0; i < view->sectionCount; ++i)
+        {
+            const IMAGE_SECTION_HEADER* section = &view->sections[i];
+            if (section->PointerToRawData > size || section->SizeOfRawData > size - section->PointerToRawData)
+            {
+                UiLog("%s", "[!] The executable file header is invalid.");
+                return FALSE;
+            }
+        }
+    }
     return TRUE;
 }
 
@@ -811,461 +854,6 @@ void BuildBackupPath(const char* target, char* backup, size_t backupSize)
     backup[backupSize - 1] = '\0';
 }
 
-/* ---- Service control ---- */
-
-#define WARP_SERVICE_NAME "CloudflareWARP"
-#define SERVICE_WAIT_TIMEOUT_MS 30000
-#define SERVICE_POLL_INTERVAL_MS 250
-
-/* Stop the CloudflareWARP service and wait until it is fully stopped.
-   Sets *outWasRunning to TRUE if the service was running (or start-pending)
-   when we opened it, so the caller knows whether to restart it afterward.
-   Returns TRUE if the service is stopped (or absent) by the time we return. */
-BOOL StopWarpService(BOOL* outWasRunning)
-{
-    SC_HANDLE scm;
-    SC_HANDLE svc;
-    SERVICE_STATUS status;
-    DWORD waited = 0;
-
-    if (outWasRunning)
-    {
-        *outWasRunning = FALSE;
-    }
-
-    scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
-    if (!scm)
-    {
-        UiLog("%s", Tr(STR_LOG_ERR_SCM_ADMIN));
-        return FALSE;
-    }
-
-    svc = OpenServiceA(scm, WARP_SERVICE_NAME,
-                       SERVICE_QUERY_STATUS | SERVICE_STOP);
-    if (!svc)
-    {
-        DWORD err = GetLastError();
-        CloseServiceHandle(scm);
-        if (err == ERROR_SERVICE_DOES_NOT_EXIST)
-        {
-            return TRUE;   /* not installed: nothing to control */
-        }
-        UiLog("%s", Tr(STR_LOG_ERR_ACCESS_SERVICE));
-        return FALSE;
-    }
-
-    if (!QueryServiceStatus(svc, &status))
-    {
-        UiLog("%s", Tr(STR_LOG_ERR_CHECK_SERVICE_STATUS));
-        CloseServiceHandle(svc);
-        CloseServiceHandle(scm);
-        return FALSE;
-    }
-
-    if (status.dwCurrentState == SERVICE_STOPPED)
-    {
-        CloseServiceHandle(svc);
-        CloseServiceHandle(scm);
-        return TRUE;
-    }
-
-    if (outWasRunning)
-    {
-        *outWasRunning = TRUE;
-    }
-
-    UiLog("%s", Tr(STR_LOG_STOP_SERVICE));
-    if (status.dwCurrentState != SERVICE_STOP_PENDING)
-    {
-        if (!ControlService(svc, SERVICE_CONTROL_STOP, &status))
-        {
-            UiLog("%s", Tr(STR_LOG_ERR_STOP_SERVICE));
-            CloseServiceHandle(svc);
-            CloseServiceHandle(scm);
-            return FALSE;
-        }
-    }
-
-    while (status.dwCurrentState != SERVICE_STOPPED &&
-           waited < SERVICE_WAIT_TIMEOUT_MS)
-    {
-        Sleep(SERVICE_POLL_INTERVAL_MS);
-        waited += SERVICE_POLL_INTERVAL_MS;
-        if (!QueryServiceStatus(svc, &status))
-        {
-            break;
-        }
-    }
-
-    CloseServiceHandle(svc);
-    CloseServiceHandle(scm);
-
-    if (status.dwCurrentState != SERVICE_STOPPED)
-    {
-        UiLog("%s", Tr(STR_LOG_ERR_STOP_TIMEOUT));
-        return FALSE;
-    }
-
-    return TRUE;
-}
-
-/* Start the CloudflareWARP service and wait until it is running. */
-BOOL StartWarpService(void)
-{
-    SC_HANDLE scm;
-    SC_HANDLE svc;
-    SERVICE_STATUS status;
-    DWORD waited = 0;
-
-    scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
-    if (!scm)
-    {
-        UiLog("%s", Tr(STR_LOG_ERR_SCM_ADMIN));
-        return FALSE;
-    }
-
-    svc = OpenServiceA(scm, WARP_SERVICE_NAME,
-                       SERVICE_QUERY_STATUS | SERVICE_START);
-    if (!svc)
-    {
-        UiLog("%s", Tr(STR_LOG_ERR_OPEN_SERVICE_START));
-        CloseServiceHandle(scm);
-        return FALSE;
-    }
-
-    UiLog("%s", Tr(STR_LOG_START_SERVICE));
-    if (!StartServiceA(svc, 0, NULL))
-    {
-        DWORD err = GetLastError();
-        if (err != ERROR_SERVICE_ALREADY_RUNNING)
-        {
-            UiLog("%s", Tr(STR_LOG_ERR_START_SERVICE));
-            CloseServiceHandle(svc);
-            CloseServiceHandle(scm);
-            return FALSE;
-        }
-    }
-
-    if (!QueryServiceStatus(svc, &status))
-    {
-        status.dwCurrentState = SERVICE_START_PENDING;
-    }
-
-    while (status.dwCurrentState != SERVICE_RUNNING &&
-           waited < SERVICE_WAIT_TIMEOUT_MS)
-    {
-        Sleep(SERVICE_POLL_INTERVAL_MS);
-        waited += SERVICE_POLL_INTERVAL_MS;
-        if (!QueryServiceStatus(svc, &status))
-        {
-            break;
-        }
-    }
-
-    CloseServiceHandle(svc);
-    CloseServiceHandle(scm);
-
-    if (status.dwCurrentState != SERVICE_RUNNING)
-    {
-        UiLog("%s", Tr(STR_LOG_ERR_START_TIMEOUT));
-        return FALSE;
-    }
-
-    return TRUE;
-}
-
-/* ---- Pre-patch cleanup / tunnel handling ---- */
-
-/* Copy the directory portion of a path (everything up to the last separator)
-   into dir. If there is no separator, dir is set to empty. */
-static void GetDirName(const char* path, char* dir, size_t dirSize)
-{
-    const char* lastSep = NULL;
-    const char* p;
-    size_t len;
-
-    for (p = path; *p; ++p)
-    {
-        if (*p == '\\' || *p == '/')
-        {
-            lastSep = p;
-        }
-    }
-
-    if (!lastSep)
-    {
-        dir[0] = '\0';
-        return;
-    }
-
-    len = (size_t)(lastSep - path);
-    if (len >= dirSize)
-    {
-        len = dirSize - 1;
-    }
-    memcpy(dir, path, len);
-    dir[len] = '\0';
-}
-
-/* Delete a stray userenv.dll sitting next to the target. A userenv.dll planted
-   in the service directory is a classic DLL-sideloading vector: warp-svc.exe
-   would load it in preference to the real one in System32. We remove it before
-   patching so the freshly patched service does not start against a hijack DLL. */
-BOOL RemoveSideloadedUserenv(const char* target)
-{
-    char dir[MAX_PATH * 2];
-    char dll[MAX_PATH * 2];
-
-    GetDirName(target, dir, sizeof(dir));
-    if (dir[0] == '\0')
-    {
-        return TRUE;   /* no directory component; nothing to check */
-    }
-
-    _snprintf(dll, sizeof(dll), "%s\\userenv.dll", dir);
-    dll[sizeof(dll) - 1] = '\0';
-
-    if (!FileExists(dll))
-    {
-        return TRUE;   /* clean: no sideloaded DLL present */
-    }
-
-    UiLog("%s", Tr(STR_LOG_CLEANING_USERENV));
-    if (!DeleteFileA(dll))
-    {
-        UiLog(Tr(STR_LOG_ERR_DELETE_USERENV), dll);
-        return FALSE;
-    }
-
-    UiLog("%s", Tr(STR_LOG_CLEANED_USERENV));
-    return TRUE;
-}
-
-/* Run cmdLine (with its working directory set to workDir if non-NULL) and
-   capture up to outSize-1 bytes of its stdout+stderr into out. Returns TRUE and
-   sets *outExit to the process exit code on success. */
-static BOOL RunAndCapture(const char* cmdLine, const char* workDir,
-                          char* out, size_t outSize, DWORD* outExit)
-{
-    SECURITY_ATTRIBUTES sa;
-    HANDLE readPipe = NULL, writePipe = NULL;
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-    char cmd[MAX_PATH * 4];
-    size_t total = 0;
-    BOOL ok = FALSE;
-
-    out[0] = '\0';
-    if (outExit)
-    {
-        *outExit = (DWORD)-1;
-    }
-
-    memset(&sa, 0, sizeof(sa));
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-
-    if (!CreatePipe(&readPipe, &writePipe, &sa, 0))
-    {
-        return FALSE;
-    }
-    /* The read end must not be inherited by the child. */
-    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
-
-    memset(&si, 0, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    si.hStdOutput = writePipe;
-    si.hStdError = writePipe;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-
-    memset(&pi, 0, sizeof(pi));
-
-    /* CreateProcess may modify the command-line buffer, so use a writable copy. */
-    _snprintf(cmd, sizeof(cmd), "%s", cmdLine);
-    cmd[sizeof(cmd) - 1] = '\0';
-
-    if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
-                        NULL, workDir, &si, &pi))
-    {
-        CloseHandle(readPipe);
-        CloseHandle(writePipe);
-        return FALSE;
-    }
-
-    /* Close our copy of the write end so the read returns EOF when the child
-       exits; then drain the pipe. */
-    CloseHandle(writePipe);
-    writePipe = NULL;
-
-    for (;;)
-    {
-        DWORD got = 0;
-        if (!ReadFile(readPipe, out + total,
-                      (DWORD)(outSize - 1 - total), &got, NULL) || got == 0)
-        {
-            break;
-        }
-        total += got;
-        if (total >= outSize - 1)
-        {
-            break;
-        }
-    }
-    out[total] = '\0';
-
-    WaitForSingleObject(pi.hProcess, SERVICE_WAIT_TIMEOUT_MS);
-    if (outExit)
-    {
-        GetExitCodeProcess(pi.hProcess, outExit);
-    }
-    ok = TRUE;
-
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    CloseHandle(readPipe);
-    return ok;
-}
-
-/* Case-insensitive substring search. */
-static BOOL ContainsNoCase(const char* haystack, const char* needle)
-{
-    size_t nlen = strlen(needle);
-    const char* p;
-    if (nlen == 0)
-    {
-        return TRUE;
-    }
-    for (p = haystack; *p; ++p)
-    {
-        if (_strnicmp(p, needle, nlen) == 0)
-        {
-            return TRUE;
-        }
-    }
-    return FALSE;
-}
-
-/* Case-insensitive whole-word substring search. */
-static BOOL ContainsWordNoCase(const char* haystack, const char* needle)
-{
-    size_t nlen = strlen(needle);
-    const char* p;
-    if (nlen == 0)
-    {
-        return TRUE;
-    }
-    for (p = haystack; *p; ++p)
-    {
-        if (_strnicmp(p, needle, nlen) == 0)
-        {
-            BOOL leftOk = (p == haystack) || !isalpha((unsigned char)*(p - 1));
-            BOOL rightOk = !isalpha((unsigned char)*(p + nlen));
-            if (leftOk && rightOk)
-            {
-                return TRUE;
-            }
-        }
-    }
-    return FALSE;
-}
-
-/* Build the path to warp-cli.exe (next to the target) into cli. Returns FALSE
-   if the target has no directory component or the CLI is not present. */
-static BOOL FindWarpCli(const char* target, char* cli, size_t cliSize)
-{
-    char dir[MAX_PATH * 2];
-
-    GetDirName(target, dir, sizeof(dir));
-    if (dir[0] == '\0')
-    {
-        return FALSE;
-    }
-
-    _snprintf(cli, cliSize, "%s\\warp-cli.exe", dir);
-    cli[cliSize - 1] = '\0';
-
-    return FileExists(cli);
-}
-
-/* If WARP is Connected, disconnect it before we stop/patch the service.
-   warp-cli.exe is expected in the same directory as the target. Sets
-   *outWasConnected to TRUE if WARP was connected (so the caller can reconnect
-   afterward). Best-effort: a missing CLI or a query we cannot parse is logged
-   and treated as success so patching still proceeds. */
-BOOL WarpDisconnectIfConnected(const char* target, BOOL* outWasConnected)
-{
-    char cli[MAX_PATH * 2];
-    char cmd[MAX_PATH * 4];
-    char output[4096];
-    DWORD exitCode = 0;
-
-    if (outWasConnected)
-    {
-        *outWasConnected = FALSE;
-    }
-
-    if (!FindWarpCli(target, cli, sizeof(cli)))
-    {
-        return TRUE;
-    }
-
-    _snprintf(cmd, sizeof(cmd), "\"%s\" status", cli);
-    cmd[sizeof(cmd) - 1] = '\0';
-
-    if (!RunAndCapture(cmd, NULL, output, sizeof(output), &exitCode))
-    {
-        return TRUE;
-    }
-
-    if (ContainsNoCase(output, "Disconnected") || !ContainsWordNoCase(output, "Connected"))
-    {
-        return TRUE;
-    }
-
-    if (outWasConnected)
-    {
-        *outWasConnected = TRUE;
-    }
-
-    UiLog("%s", Tr(STR_LOG_DISCONNECTING));
-    _snprintf(cmd, sizeof(cmd), "\"%s\" disconnect", cli);
-    cmd[sizeof(cmd) - 1] = '\0';
-
-    if (!RunAndCapture(cmd, NULL, output, sizeof(output), &exitCode))
-    {
-        return TRUE;
-    }
-
-    return TRUE;
-}
-
-/* Reconnect WARP after patching. warp-cli.exe is expected next to the target.
-   Best-effort: a missing CLI or a failure is logged but not fatal. */
-BOOL WarpConnect(const char* target)
-{
-    char cli[MAX_PATH * 2];
-    char cmd[MAX_PATH * 4];
-    char output[4096];
-    DWORD exitCode = 0;
-
-    if (!FindWarpCli(target, cli, sizeof(cli)))
-    {
-        return TRUE;
-    }
-
-    _snprintf(cmd, sizeof(cmd), "\"%s\" connect", cli);
-    cmd[sizeof(cmd) - 1] = '\0';
-
-    if (!RunAndCapture(cmd, NULL, output, sizeof(output), &exitCode))
-    {
-        UiLog("%s", Tr(STR_LOG_RECONNECT_NOTE));
-        return FALSE;
-    }
-
-    return TRUE;
-}
 
 /* Restore the original binary from its backup. Returns TRUE on success. */
 BOOL RunRestore(const char* target)
@@ -1273,18 +861,24 @@ BOOL RunRestore(const char* target)
     char backup[MAX_PATH * 2];
     unsigned char* data;
     size_t size;
+    PE_VIEW view;
 
     BuildBackupPath(target, backup, sizeof(backup));
 
     if (!FileExists(backup))
     {
-        UiLog("%s", Tr(STR_LOG_ERR_NO_BACKUP));
+        UiLog("%s", "[!] No backup file found. There is nothing to restore.");
         return FALSE;
     }
 
     data = ReadWholeFile(backup, &size);
     if (!data)
     {
+        return FALSE;
+    }
+    if (!ParsePe(data, size, &view))
+    {
+        free(data);
         return FALSE;
     }
 
@@ -1301,8 +895,8 @@ BOOL RunRestore(const char* target)
             free(cur);
             if (targetSize != size)
             {
-                UiLog("%s", Tr(STR_LOG_ERR_BACKUP_DIFF_VER));
-                UiLog("%s", Tr(STR_LOG_ERR_CURRENT_UNPATCHED));
+                UiLog("%s", "[!] The backup file is from a different version of Cloudflare WARP.");
+                UiLog("%s", "    The current warp-svc.exe is already an original unpatched version.");
                 free(data);
                 return FALSE;
             }
@@ -1317,7 +911,7 @@ BOOL RunRestore(const char* target)
 
     free(data);
     DeleteFileA(backup);
-    UiLog("%s", Tr(STR_LOG_RESTORED_OK));
+    UiLog("%s", "Original file restored from backup.");
     return TRUE;
 }
 
@@ -1334,6 +928,28 @@ static size_t CountTargets(const OCCURRENCE* occs, size_t occCount)
         }
     }
     return n;
+}
+
+BOOL RunInspect(const char* target)
+{
+    size_t size = 0, masqueCount, regCount;
+    PE_VIEW view;
+    OCCURRENCE occurrences[MAX_OCCURRENCES];
+    unsigned char* data = ReadWholeFile(target, &size);
+    if (!data) return FALSE;
+    if (!ParsePe(data, size, &view)) { free(data); return FALSE; }
+    masqueCount = CollectOccurrences(&view, g_MasqueHostnames, MASQUE_HOSTNAME_COUNT,
+                                     FALSE, occurrences, MAX_OCCURRENCES);
+    masqueCount = CountTargets(occurrences, masqueCount);
+    regCount = CollectOccurrences(&view, g_RegHostnames, REG_HOSTNAME_COUNT,
+                                  TRUE, occurrences, MAX_OCCURRENCES);
+    regCount = CountTargets(occurrences, regCount);
+    UiLog("Format: PE\nArchitectures: x86_64\nMASQUE literals: %zu\nRegistration literals: %zu",
+          masqueCount, regCount);
+    if (!masqueCount || !regCount)
+        UiLog("Original hostnames are missing; this file may be patched or unsupported.");
+    free(data);
+    return TRUE;
 }
 
 /* Smallest length among the patch-target entries of a known-hostname list;
@@ -1405,6 +1021,8 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
 {
     char backup[MAX_PATH * 2];
     unsigned char* source = NULL;
+    unsigned char* original = NULL;
+    BOOL refreshBackup = FALSE;
     size_t sourceSize = 0;
     size_t targetSize = 0;
     PE_VIEW view;
@@ -1428,39 +1046,44 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
     DWORD codeImmsPatched = 0;
     BOOL regLenChanged;
 
-    newLen = strlen(newSni);
+    newLen = newSni ? strlen(newSni) : 0;
     minMasqueLen = MinTargetLength(g_MasqueHostnames, MASQUE_HOSTNAME_COUNT);
-    if (newLen == 0)
+    if (!newSni && !newRegSni)
     {
-        UiLog(Tr(STR_LOG_ERR_EMPTY_SNI), DEFAULT_SNI);
+        UiLog("[!] Please specify at least one of MASQUE SNI or registration API.");
         return FALSE;
     }
-    if (newLen > minMasqueLen)
+    if (newSni && newLen == 0)
     {
-        UiLog(Tr(STR_LOG_ERR_SNI_TOO_LONG),
+        UiLog("[!] MASQUE SNI cannot be empty. Please enter a hostname (e.g. %s).", DEFAULT_SNI);
+        return FALSE;
+    }
+    if (newSni && newLen > minMasqueLen)
+    {
+        UiLog("[!] The MASQUE SNI '%s' is too long (%zu characters; maximum allowed is %zu).",
               newSni, newLen, minMasqueLen);
-        UiLog(Tr(STR_LOG_TIP_DEFAULT_SNI), DEFAULT_SNI);
+        UiLog("    Tip: The default '%s' is recommended.", DEFAULT_SNI);
         return FALSE;
     }
 
-    regLenPlain = strlen(newRegSni);
-    if (regLenPlain == 0)
+    regLenPlain = newRegSni ? strlen(newRegSni) : 0;
+    if (newRegSni && regLenPlain == 0)
     {
-        UiLog(Tr(STR_LOG_ERR_EMPTY_REG_SNI), DEFAULT_REG_SNI);
+        UiLog("[!] Registration API hostname cannot be empty. Please enter a hostname (e.g. %s).", DEFAULT_REG_SNI);
         return FALSE;
     }
-    if (regLenPlain > sizeof(regDotted) - 2)
+    if (newRegSni && regLenPlain > sizeof(regDotted) - 2)
     {
-        UiLog(Tr(STR_LOG_ERR_REG_SNI_TOO_LONG),
+        UiLog("[!] The registration hostname is too long (maximum %zu characters).",
               sizeof(regDotted) - 2);
-        UiLog(Tr(STR_LOG_TIP_DEFAULT_REG_SNI), DEFAULT_REG_SNI);
+        UiLog("    Tip: The default '%s' is recommended.", DEFAULT_REG_SNI);
         return FALSE;
     }
 
     if (!FileExists(target))
     {
-        UiLog(Tr(STR_LOG_ERR_FIND_WARP_SVC), target);
-        UiLog("%s", Tr(STR_LOG_ERR_VERIFY_PATH));
+        UiLog("[!] Could not find warp-svc.exe at: %s", target);
+        UiLog("%s", "    Please verify the installation path.");
         return FALSE;
     }
 
@@ -1500,64 +1123,80 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
 
         if (masqOk && regOk)
         {
-            /* Pristine target -> (re)create the backup from it. */
-            if (!WriteWholeFile(backup, targetBuf, targetSize))
-            {
-                free(targetBuf);
-                return FALSE;
-            }
+            /* Pristine source containing all original hostnames: refresh the backup */
+            refreshBackup = TRUE;
             source = targetBuf;
             sourceSize = targetSize;
             view = targetView;
-            masqueCount = tMasque;
-            regCount = tReg;
-            UiLog("%s", Tr(STR_LOG_BACKUP));
+            masqueCount = newSni ? tMasque : 0;
+            regCount = newRegSni ? tReg : 0;
         }
         else
         {
-            /* Already-patched target -> need the backup as the pristine source. */
-            free(targetBuf);
+            /* Target is already patched -> never refresh backup from a non-pristine target */
+            refreshBackup = FALSE;
 
             if (!FileExists(backup))
             {
-                UiLog("%s", Tr(STR_LOG_ERR_NO_ORIG_HOSTS_AND_NO_BACKUP));
-                UiLog("%s", Tr(STR_LOG_ERR_ALREADY_PATCHED_OR_UNSUPPORTED));
+                UiLog("%s", "[!] Could not find original hostnames in warp-svc.exe and no backup exists.");
+                UiLog("%s", "    The file may already be patched, or this version of WARP is not supported.");
+                free(targetBuf);
                 return FALSE;
             }
 
-            source = ReadWholeFile(backup, &sourceSize);
-            if (!source)
+            /* Can targetBuf provide the targets for the requested patch? */
+            BOOL canUseTarget = TRUE;
+            if (newSni && !masqOk) canUseTarget = FALSE;
+            if (newRegSni && !regOk) canUseTarget = FALSE;
+
+            if (canUseTarget)
             {
-                return FALSE;
+                source = targetBuf;
+                sourceSize = targetSize;
+                view = targetView;
+                masqueCount = newSni ? tMasque : 0;
+                regCount = newRegSni ? tReg : 0;
             }
-
-            if (sourceSize != targetSize)
+            else
             {
-                UiLog("%s", Tr(STR_LOG_ERR_BACKUP_DIFF_VER));
-                UiLog(Tr(STR_LOG_ERR_DELETE_BACKUP_FRESH), backup);
-                free(source);
-                return FALSE;
-            }
+                free(targetBuf);
 
-            if (!ParsePe(source, sourceSize, &view))
-            {
-                free(source);
-                return FALSE;
-            }
+                source = ReadWholeFile(backup, &sourceSize);
+                if (!source)
+                {
+                    return FALSE;
+                }
 
-            masqueCount = CollectOccurrences(&view, g_MasqueHostnames,
+                if (sourceSize != targetSize)
+                {
+                    UiLog("%s", "[!] The backup file is from a different version of Cloudflare WARP.");
+                    UiLog("    Please delete '%s' and re-run against a fresh installation.", backup);
+                    free(source);
+                    return FALSE;
+                }
+
+                if (!ParsePe(source, sourceSize, &view))
+                {
+                    free(source);
+                    return FALSE;
+                }
+
+                tMasque = CollectOccurrences(&view, g_MasqueHostnames,
                                              MASQUE_HOSTNAME_COUNT, FALSE,
                                              masqueOccs, MAX_OCCURRENCES);
-            regCount = CollectOccurrences(&view, g_RegHostnames,
+                tReg = CollectOccurrences(&view, g_RegHostnames,
                                           REG_HOSTNAME_COUNT, TRUE,
                                           regOccs, MAX_OCCURRENCES);
-            if (CountTargets(masqueOccs, masqueCount) == 0 ||
-                CountTargets(regOccs, regCount) == 0)
-            {
-                UiLog("%s", Tr(STR_LOG_ERR_BACKUP_NO_ORIG_HOSTS));
-                UiLog("%s", Tr(STR_LOG_ERR_BACKUP_UNSUPPORTED));
-                free(source);
-                return FALSE;
+                masqueCount = newSni ? tMasque : 0;
+                regCount = newRegSni ? tReg : 0;
+                if ((newSni && CountTargets(masqueOccs, masqueCount) == 0) ||
+                    (newRegSni && CountTargets(regOccs, regCount) == 0))
+                {
+                    UiLog("%s", "[!] Could not find original hostnames in the backup file.");
+                    UiLog("%s", "    This version of Cloudflare WARP may not be supported.");
+                    free(source);
+                    return FALSE;
+                }
             }
         }
     }
@@ -1567,6 +1206,14 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
 
     /* Every API host is stored as a trailing-dot FQDN, so prefer the dotted
        form of the input; fall back to as-typed only when that alone fits. */
+    if (!newRegSni)
+    {
+        regCount = 0;
+        regFinal = "";
+        regLenFinal = 0;
+    }
+    else
+    {
     if (newRegSni[regLenPlain - 1] == '.')
     {
         regLenDotted = regLenPlain;
@@ -1592,34 +1239,47 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
     }
     else
     {
-        UiLog(Tr(STR_LOG_ERR_REG_HOSTNAME_TOO_LONG),
+        UiLog("[!] Registration hostname '%s' is too long (%zu characters; maximum is %zu).",
               newRegSni, regLenPlain, regCap);
-        UiLog(Tr(STR_LOG_TIP_DEFAULT_REG_SNI), DEFAULT_REG_SNI);
+        UiLog("    Tip: The default '%s' is recommended.", DEFAULT_REG_SNI);
         free(source);
         return FALSE;
     }
+    }
+
+    if (refreshBackup)
+    {
+        original = (unsigned char*)malloc(sourceSize);
+        if (!original) { free(source); return FALSE; }
+        memcpy(original, source, sourceSize);
+    }
 
     /* Overwrite the hostname strings in place. */
-    for (i = 0; i < masqueCount; ++i)
+    if (newSni)
     {
-        if (masqueOccs[i].known->patchTarget)
+        for (i = 0; i < masqueCount; ++i)
         {
-            OverwriteHostname(&view, &masqueOccs[i], newSni, newLen);
+            if (masqueOccs[i].known->patchTarget)
+            {
+                OverwriteHostname(&view, &masqueOccs[i], newSni, newLen);
+            }
         }
+        lenFieldsPatched += PatchFatPointerLengths(&view, masqueOccs, masqueCount, newLen);
+        codeImmsPatched += PatchCodeLengthImmediates(&view, masqueOccs, masqueCount, newLen);
     }
-    for (i = 0; i < regCount; ++i)
+    if (newRegSni)
     {
-        if (regOccs[i].known->patchTarget)
+        for (i = 0; i < regCount; ++i)
         {
-            OverwriteHostname(&view, &regOccs[i], regFinal, regLenFinal);
+            if (regOccs[i].known->patchTarget)
+            {
+                OverwriteHostname(&view, &regOccs[i], regFinal, regLenFinal);
+            }
         }
+        lenFieldsPatched += PatchFatPointerLengths(&view, regOccs, regCount, regLenFinal);
+        soaPatched = PatchSoaLengths(&view, regOccs, regCount, regLenFinal);
+        codeImmsPatched += PatchCodeLengthImmediates(&view, regOccs, regCount, regLenFinal);
     }
-
-    lenFieldsPatched += PatchFatPointerLengths(&view, masqueOccs, masqueCount, newLen);
-    lenFieldsPatched += PatchFatPointerLengths(&view, regOccs, regCount, regLenFinal);
-    soaPatched = PatchSoaLengths(&view, regOccs, regCount, regLenFinal);
-    codeImmsPatched += PatchCodeLengthImmediates(&view, masqueOccs, masqueCount, newLen);
-    codeImmsPatched += PatchCodeLengthImmediates(&view, regOccs, regCount, regLenFinal);
 
     /* If the reg length changed, the ptr/len array must have been updated, or
        the service would read a truncated hostname -- refuse to write. */
@@ -1634,12 +1294,20 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
     }
     if (regLenChanged && soaPatched == 0)
     {
-        UiLog("%s", Tr(STR_LOG_ERR_REG_UPDATE_UNSAFE));
-        UiLog(Tr(STR_LOG_TIP_DEFAULT_REG_SNI), DEFAULT_REG_SNI);
+        UiLog("%s", "[!] Could not safely update registration hostname in this version of WARP.");
+        UiLog("    Tip: The default '%s' is recommended.", DEFAULT_REG_SNI);
         free(source);
+        free(original);
         return FALSE;
     }
 
+    if (original)
+    {
+        BOOL backedUp = WriteWholeFile(backup, original, sourceSize);
+        free(original);
+        if (!backedUp) { free(source); return FALSE; }
+        UiLog("%s", "Backup...");
+    }
     if (!WriteWholeFile(target, view.base, view.size))
     {
         free(source);
@@ -1661,8 +1329,8 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
         memset(cleanNewSni, 0, sizeof(cleanNewSni));
         memset(cleanNewRegSni, 0, sizeof(cleanNewRegSni));
 
-        StripTrailingDot(newSni, cleanNewSni, sizeof(cleanNewSni));
-        StripTrailingDot(newRegSni, cleanNewRegSni, sizeof(cleanNewRegSni));
+        if (newSni) StripTrailingDot(newSni, cleanNewSni, sizeof(cleanNewSni));
+        if (newRegSni) StripTrailingDot(newRegSni, cleanNewRegSni, sizeof(cleanNewRegSni));
 
         /* Collect unique patched MASQUE hostnames in definition order */
         for (k = 0; k < MASQUE_HOSTNAME_COUNT; ++k)
@@ -1734,7 +1402,7 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
             }
         }
 
-        UiLog("%s", Tr(STR_LOG_PATCHING));
+        UiLog("%s", "Patching...");
         /* UiLog("MASQUE SNI:");
         if (uniqueMasqueCount > 0)
         {
@@ -1763,3 +1431,40 @@ BOOL RunPatch(const char* target, const char* newSni, const char* newRegSni)
     }
     return TRUE;
 }
+
+#endif // _WIN32
+
+
+namespace warp {
+
+
+
+Inspection inspect_pe(const Bytes&) {
+    Inspection insp;
+    insp.format = "PE";
+    insp.architectures = {"x86_64"};
+    insp.notes.push_back("Windows PE64 format");
+    return insp;
+}
+
+PatchResult patch_pe(const Bytes&, const PatchOptions&) {
+    throw std::runtime_error("Direct in-memory patching for PE is handled via RunPatch on disk.");
+}
+
+} // namespace warp
+#else // !_WIN32
+
+namespace warp {
+
+Inspection inspect_pe(const Bytes&) {
+    Inspection insp;
+    insp.format = "PE";
+    insp.architectures = {"x86_64"};
+    return insp;
+}
+PatchResult patch_pe(const Bytes&, const PatchOptions&) {
+    throw std::runtime_error("PE patching is only supported on Windows.");
+}
+} // namespace warp
+
+#endif

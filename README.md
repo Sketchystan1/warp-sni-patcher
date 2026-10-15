@@ -1,26 +1,31 @@
 # WARP SNI Patcher
 
-A small tool that patches Cloudflare WARP's `warp-svc.exe` on disk to override the MASQUE tunnel SNI and the registration API hostname.
+Change Cloudflare WARP's MASQUE SNI and registration API hostname on Windows, Linux, and macOS.
 
-## How it works
+## Use
 
-The patcher parses `warp-svc.exe` as a PE image, and for each known hostname it:
+1. Download and extract your platform's package from [Releases](https://github.com/Sketchystan1/warp-sni-patcher/releases/latest).
+2. Open the executable on Windows, or run `./warp-sni-patcher --gui` on Linux/macOS. Linux bundles [FLTK](https://www.fltk.org/) and needs X11/XWayland plus system libraries compatible with Ubuntu 22.04.
+3. Enter hostnames and click **Patch**. Use **Restore** to recover the original file from its `.bak` backup.
 
-1. Overwrites the hostname string in place with the new value (same address, so no pointer repointing needed).
-2. Fixes the associated length values — fat-pointer length fields in data, `mov r32, imm32` immediates near the `lea` that loads the hostname, and (registration host only) the parallel ptr/len arrays `warp-svc` indexes at runtime.
+Modifying installed WARP requires administrator/root privileges. For CLI options, run with `--help`.
 
-MASQUE hostnames are packed string-table literals, so the replacement must fit the original length; the tail is left untouched (Rust `&str` is `(ptr, len)` with no NUL terminator, so the patched length bounds every read). Registration hosts sit in fixed 32-byte slots, so the replacement may be longer, up to the slot capacity.
+Patching invalidates WARP's signature; updates may undo patches. Releases have no trusted publisher signature.
 
-The original binary is preserved as `<target>.bak`, refreshed whenever the target is still pristine, so re-running after a WARP update stays clean. Patching breaks the Authenticode signature.
+On macOS, run `warp-cli registration delete` **before Patch or Restore**, then register again afterward (`warp-cli registration new` for personal WARP; sign in again for Zero Trust). This resets device registration because ad-hoc signing changes Keychain access. Restore recovers Cloudflare's original signature. PacketTunnel mode is unsupported; use WARP's default in-daemon tunnel. Dependency notices: `--licenses`.
+
+## Build
+
+Run `build.bat` on Windows. Requirements:
+
+- Windows: Visual Studio C++ tools, CMake, Python 3.12+.
+- WSL: CMake, Make, g++, Python 3.12+, FLTK development files.
+- OSXCross in WSL with an Apple SDK and both Intel/ARM64 toolchains.
+
+After a successful build, `build/` contains only the Windows ZIP, Linux TAR.GZ, and universal macOS ZIP. Other contents are removed. Build caches stay outside `build/`; Python utilities live in [scripts/](scripts/). Local Linux builds inherit the build system's library requirements.
 
 ## Releases
 
-Pre-built release packages (`.zip`) are available on the [Releases](https://github.com/Sketchystan1/warp-sni-patcher/releases) page. See [CHANGELOG.md](CHANGELOG.md) for details on each release.
+One GitHub workflow builds and tests all platforms. Push a new [changelog](CHANGELOG.md) version to `master`/`main`, push its matching version tag, or run the workflow manually to publish. Pull requests only build and test.
 
-## Building from source
-
-Requires Visual Studio with C++ desktop development tools (MSVC x64). Run:
-
-```cmd
-build.bat
-```
+Each release includes three platform packages, with notes from the changelog. GitHub displays their SHA-256 hashes and adds source archives. The macOS ZIP supports Intel and Apple silicon; Actions tests both against WARP 2026.8.2110.0. Operation with SIP enabled remains unverified.
