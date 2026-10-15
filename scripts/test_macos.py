@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+import zipfile
 
 from download import Package, download_package
 
@@ -17,7 +18,7 @@ SHA256 = "cc654394ed16d3d0e3905eaa32dc2d7d97d1de0d29f455972087b0a6779588e7"
 RESOURCES = Path("/Applications/Cloudflare WARP.app/Contents/Resources")
 DAEMON = RESOURCES / "CloudflareWARP"
 CLI = RESOURCES / "warp-cli"
-PATCHER = Path(".cache/native/warp-sni-patcher").resolve()
+PATCHER = Path(".cache/macos-smoke/warp-sni-patcher").resolve()
 
 
 def run(*args, check=True, timeout=60, show=False):
@@ -88,7 +89,8 @@ def signature():
 def register_after_signing(phase):
     status = cli("status").stdout
     if "Registration Missing" in status:
-        print(f"{phase}: signing identity changed; creating a fresh disposable test registration", flush=True)
+        print(f"{phase}: signing identity changed; resetting the disposable test registration", flush=True)
+        cli("registration", "delete", show=True)
         cli("registration", "new", timeout=90)
 
 
@@ -100,6 +102,18 @@ def main():
     if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
         raise RuntimeError("This destructive integration test requires a disposable macOS Actions runner")
     print(f"Testing WARP {VERSION} on macOS {platform.mac_ver()[0]} {platform.machine()}", flush=True)
+    archives = list(Path(".cache/native").glob("warp-sni-patcher-*-macos.zip"))
+    if len(archives) != 1:
+        raise RuntimeError("Expected exactly one macOS package")
+    with zipfile.ZipFile(archives[0]) as archive:
+        if archive.namelist() != ["warp-sni-patcher"]:
+            raise RuntimeError("The macOS ZIP must contain only the executable")
+        if archive.getinfo("warp-sni-patcher").external_attr >> 16 & 0o777 != 0o755:
+            raise RuntimeError("The packaged executable must have mode 0755")
+        PATCHER.parent.mkdir(exist_ok=True)
+        PATCHER.write_bytes(archive.read("warp-sni-patcher"))
+    PATCHER.chmod(0o755)
+    run("codesign", "--verify", "--strict", "--all-architectures", PATCHER)
     package, _ = download_package(Package("macos", VERSION, "pkg",
         f"https://downloads.cloudflareclient.com/v1/download/macos/version/{VERSION}"), Path(".cache"), False)
     if digest(package) != SHA256:
