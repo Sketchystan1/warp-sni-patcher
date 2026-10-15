@@ -8,7 +8,8 @@ import platform
 import subprocess
 import sys
 import time
-import urllib.request
+
+from download import Package, download_package
 
 VERSION = "2026.8.2110.0"
 SHA256 = "cc654394ed16d3d0e3905eaa32dc2d7d97d1de0d29f455972087b0a6779588e7"
@@ -71,8 +72,8 @@ def main():
     if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
         raise RuntimeError("This destructive integration test requires a disposable macOS Actions runner")
     print(f"Testing WARP {VERSION} on macOS {platform.mac_ver()[0]} {platform.machine()}", flush=True)
-    package = Path(".cache") / f"Cloudflare_WARP_{VERSION}.pkg"
-    urllib.request.urlretrieve(f"https://downloads.cloudflareclient.com/v1/download/macos/version/{VERSION}", package)
+    package, _ = download_package(Package("macos", VERSION, "pkg",
+        f"https://downloads.cloudflareclient.com/v1/download/macos/version/{VERSION}"), Path(".cache"), False)
     if digest(package) != SHA256:
         raise RuntimeError("Official WARP package checksum mismatch")
     run("sudo", "installer", "-pkg", package, "-target", "/", timeout=180, show=True)
