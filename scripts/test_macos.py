@@ -123,8 +123,12 @@ def main():
         PATCHER.write_bytes(archive.read("warp-sni-patcher"))
     PATCHER.chmod(0o755)
     run("codesign", "--verify", "--strict", "--all-architectures", PATCHER)
-    package, _ = download_package(Package("macos", VERSION, "pkg",
-        f"https://downloads.cloudflareclient.com/v1/download/macos/version/{VERSION}"), Path(".cache"), False)
+    pkg_path = Path(".cache") / f"Cloudflare_WARP_{VERSION}.pkg"
+    if pkg_path.is_file() and digest(pkg_path) == SHA256:
+        package = pkg_path
+    else:
+        package, _ = download_package(Package("macos", VERSION, "pkg",
+            f"https://downloads.cloudflareclient.com/v1/download/macos/version/{VERSION}"), Path(".cache"), force=True, retries=4)
     if digest(package) != SHA256:
         raise RuntimeError("Official WARP package checksum mismatch")
     run("sudo", "installer", "-pkg", package, "-target", "/", timeout=180, show=True)

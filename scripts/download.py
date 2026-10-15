@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
+import time
 from typing import Optional
 
 
@@ -141,16 +142,23 @@ def open_https(url: str):
     return response
 
 
-def fetch_catalog() -> Catalog:
-    with open_https(DOWNLOAD_PAGE) as response:
-        limit = 4 * 1024 * 1024
-        raw = response.read(limit + 1)
-    if len(raw) > limit:
-        raise DownloadError("The official download page exceeds the expected size limit.")
-    try:
-        return parse_catalog(raw.decode("utf-8"))
-    except UnicodeDecodeError as exc:
-        raise DownloadError("The official download page is not valid UTF-8.") from exc
+def fetch_catalog(retries: int = 3) -> Catalog:
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            with open_https(DOWNLOAD_PAGE) as response:
+                limit = 4 * 1024 * 1024
+                raw = response.read(limit + 1)
+            if len(raw) > limit:
+                raise DownloadError("The official download page exceeds the expected size limit.")
+            return parse_catalog(raw.decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise DownloadError("The official download page is not valid UTF-8.") from exc
+        except (DownloadError, urllib.error.URLError, http.client.HTTPException, ConnectionError, TimeoutError, OSError) as exc:
+            if attempt >= retries:
+                if isinstance(exc, DownloadError):
+                    raise
+                raise DownloadError(f"Failed to fetch catalog: {exc}") from exc
+            time.sleep(2 ** attempt)
 
 
 def read_os_release(path: Path = Path("/etc/os-release")) -> dict[str, str]:
@@ -238,7 +246,7 @@ def publish_file(staged: Path, destination: Path, force: bool) -> None:
         staged.unlink()
 
 
-def download_package(package: Package, output_dir: Path, force: bool = False) -> tuple[Path, str]:
+def download_package(package: Package, output_dir: Path, force: bool = False, retries: int = 3) -> tuple[Path, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / package.filename
     checksum_path = output_dir / (package.filename + ".sha256")
@@ -263,45 +271,93 @@ def download_package(package: Package, output_dir: Path, force: bool = False) ->
         return descriptor, path
 
     try:
-        with open_https(package.url) as response:
-            final_url = response.geturl()
-            resolved = re.search(r"/version/([0-9.]+)(?:[/?#]|$)", final_url)
-            if resolved and resolved.group(1) != package.version:
-                raise DownloadError("The latest release changed while downloading; run the command again.")
-            header_size = response.headers.get("Content-Length")
-            if header_size is not None and not re.fullmatch(r"[0-9]+", header_size):
-                raise DownloadError("The server returned an invalid Content-Length.")
-            content_length = int(header_size) if header_size is not None else None
-            if package.expected_size is not None and content_length is not None and package.expected_size != content_length:
-                raise DownloadError("Package size disagrees with the official download page ({} vs {} bytes).".format(content_length, package.expected_size))
-            expected = package.expected_size if package.expected_size is not None else content_length
-            if expected is None or expected <= 0:
-                raise DownloadError("The server did not provide a valid package size; download was not saved.")
-
+        for attempt in range(1, max(1, retries) + 1):
             descriptor, package_temp = stage()
-            digest = hashlib.sha256()
-            count = 0
-            prefix = b""
-            with os.fdopen(descriptor, "wb") as stream:
-                while True:
-                    block = response.read(1024 * 1024)
-                    if not block:
-                        break
-                    if len(prefix) < 8:
-                        prefix = (prefix + block)[:8]
-                    count += len(block)
-                    if count > expected:
-                        raise DownloadError("Downloaded package is larger than its expected size.")
-                    if len(prefix) >= len(MAGIC[package.kind]) and not prefix.startswith(MAGIC[package.kind]):
-                        raise DownloadError("The response is not a valid {} package (unexpected file signature).".format(package.kind))
-                    stream.write(block)
-                    digest.update(block)
-                if count != expected:
-                    raise DownloadError("Incomplete download: expected {} bytes, received {}.".format(expected, count))
-                if not prefix.startswith(MAGIC[package.kind]):
-                    raise DownloadError("The downloaded file has an invalid package signature.")
-                stream.flush()
-                os.fsync(stream.fileno())
+            opened_stream = False
+            try:
+                with open_https(package.url) as response:
+                    final_url = response.geturl()
+                    resolved = re.search(r"/version/([0-9.]+)(?:[/?#]|$)", final_url)
+                    if resolved:
+                        if package.version != "latest" and resolved.group(1) != package.version:
+                            raise DownloadError("The latest release changed while downloading; run the command again.")
+                        actual_version = resolved.group(1)
+                    else:
+                        actual_version = package.version
+
+                    if package.version != actual_version:
+                        package = Package(package.platform, actual_version, package.kind, package.url, package.expected_size)
+                        destination = output_dir / package.filename
+                        checksum_path = output_dir / (package.filename + ".sha256")
+                        metadata_path = output_dir / (package.filename + ".json")
+                        targets = (destination, checksum_path, metadata_path)
+                        for target in targets:
+                            if os.path.lexists(target):
+                                if not force:
+                                    raise DownloadError("File already exists: {}. Use --force to replace it.".format(target))
+                                if not stat.S_ISREG(target.lstat().st_mode):
+                                    raise DownloadError("Refusing to replace a non-regular file or symbolic link: {}".format(target))
+
+                    header_size = response.headers.get("Content-Length")
+                    if header_size is not None and not re.fullmatch(r"[0-9]+", header_size):
+                        raise DownloadError("The server returned an invalid Content-Length.")
+                    content_length = int(header_size) if header_size is not None else None
+                    if package.expected_size is not None and content_length is not None and package.expected_size != content_length:
+                        raise DownloadError("Package size disagrees with the official download page ({} vs {} bytes).".format(content_length, package.expected_size))
+                    expected = package.expected_size if package.expected_size is not None else content_length
+                    if expected is None or expected <= 0:
+                        raise DownloadError("The server did not provide a valid package size; download was not saved.")
+
+                    digest = hashlib.sha256()
+                    count = 0
+                    prefix = b""
+                    opened_stream = True
+                    with os.fdopen(descriptor, "wb") as stream:
+                        while True:
+                            block = response.read(1024 * 1024)
+                            if not block:
+                                break
+                            if len(prefix) < 8:
+                                prefix = (prefix + block)[:8]
+                            count += len(block)
+                            if count > expected:
+                                raise DownloadError("Downloaded package is larger than its expected size.")
+                            if len(prefix) >= len(MAGIC[package.kind]) and not prefix.startswith(MAGIC[package.kind]):
+                                raise DownloadError("The response is not a valid {} package (unexpected file signature).".format(package.kind))
+                            stream.write(block)
+                            digest.update(block)
+                        if count != expected:
+                            raise DownloadError("Incomplete download: expected {} bytes, received {}.".format(expected, count))
+                        if not prefix.startswith(MAGIC[package.kind]):
+                            raise DownloadError("The downloaded file has an invalid package signature.")
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                break
+            except (DownloadError, urllib.error.URLError, http.client.HTTPException, ConnectionError, TimeoutError, OSError) as exc:
+                if not opened_stream:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                if package_temp in staged_files:
+                    staged_files.remove(package_temp)
+                package_temp.unlink(missing_ok=True)
+
+                retriable = True
+                if isinstance(exc, DownloadError):
+                    msg = str(exc)
+                    if not (msg.startswith("Incomplete download:") or "unexpected file signature" in msg or "invalid package signature" in msg):
+                        retriable = False
+                elif isinstance(exc, urllib.error.HTTPError):
+                    if exc.code not in (408, 429, 500, 502, 503, 504):
+                        retriable = False
+
+                if not retriable or attempt >= retries:
+                    raise
+
+                delay = 2 ** attempt
+                print("Download attempt {}/{} failed ({}); retrying in {}s...".format(attempt, retries, exc, delay), file=sys.stderr, flush=True)
+                time.sleep(delay)
 
         sha256 = digest.hexdigest()
         metadata = {
@@ -382,6 +438,8 @@ def print_catalog(catalog: Catalog, operating_system: Optional[str], distro: Opt
         for release in sorted_versions(catalog.macos):
             if version == "latest" or release == version:
                 rows.append("macos  {:16} macos (Intel / Apple silicon)".format(release))
+    if operating_system in (None, "windows") and not distro:
+        rows.append("windows latest           windows-x64 (official MSI installer)")
     if not rows:
         raise DownloadError("No official packages match these filters; try --list without filters.")
     print("\n".join(rows))
@@ -412,14 +470,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not operating_system:
             raise DownloadError("Cannot detect a supported OS. Select --os linux, macos, or windows explicitly.")
 
+        if args.list:
+            catalog = fetch_catalog()
+            print_catalog(catalog, args.os, args.distro, args.arch, args.version)
+            return 0
+
         if operating_system == "windows":
             win_url = "https://1111-releases.cloudflareclient.com/windows/Cloudflare_WARP_Release-x64.msi"
             package = Package("windows-x64", "latest", "msi", win_url)
         else:
             catalog = fetch_catalog()
-            if args.list:
-                print_catalog(catalog, args.os, args.distro, args.arch, args.version)
-                return 0
             distro = args.distro
             if operating_system == "linux" and not distro:
                 distro = detect_distro(read_os_release())

@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.request
 import zipfile
 
@@ -67,11 +68,22 @@ def capstone_source(cache):
         url = f"https://github.com/capstone-engine/capstone/archive/refs/tags/{CAPSTONE_VERSION}.tar.gz"
         print(f"Downloading Capstone {CAPSTONE_VERSION}...", flush=True)
         partial = archive.with_suffix(".part")
-        with urllib.request.urlopen(url, timeout=60) as response, partial.open("wb") as output:
-            shutil.copyfileobj(response, output)
-        if hashlib.sha256(partial.read_bytes()).hexdigest() != CAPSTONE_SHA256:
-            raise RuntimeError("Capstone download checksum mismatch")
-        partial.replace(archive)
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with urllib.request.urlopen(url, timeout=60) as response, partial.open("wb") as output:
+                    shutil.copyfileobj(response, output)
+                if hashlib.sha256(partial.read_bytes()).hexdigest() != CAPSTONE_SHA256:
+                    raise RuntimeError("Capstone download checksum mismatch")
+                partial.replace(archive)
+                break
+            except Exception as exc:
+                partial.unlink(missing_ok=True)
+                if attempt < max_attempts:
+                    print(f"Capstone download attempt {attempt} failed ({exc}); retrying in {attempt * 2}s...", flush=True)
+                    time.sleep(attempt * 2)
+                else:
+                    raise
     if hashlib.sha256(archive.read_bytes()).hexdigest() != CAPSTONE_SHA256:
         raise RuntimeError(f"Cached Capstone checksum mismatch: {archive}")
     source = cache / f"capstone-{CAPSTONE_VERSION}"
