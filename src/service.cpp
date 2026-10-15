@@ -517,8 +517,9 @@ bool WarpDisconnectIfConnected(const std::string& target, bool* out_was_connecte
 
     Log("Disconnecting...");
     std::string disc_cmd = "\"" + cli + "\" disconnect";
-    RunPosixCommand(disc_cmd, &output, &exit_code);
-    return true;
+    if (RunPosixCommand(disc_cmd, &output, &exit_code)) return true;
+    Log("[!] Could not disconnect WARP.");
+    return false;
 #endif
 }
 
@@ -539,7 +540,23 @@ bool WarpConnect(const std::string& target) {
         Log("Note: You can reconnect the tunnel using the Cloudflare WARP app or warp-cli.");
         return false;
     }
+#ifdef __APPLE__
+    for (int i = 0; i < 60; ++i) {
+        if (RunPosixCommand("\"" + cli + "\" status", &output)) {
+            if (CaseInsensitiveContains(output, "Connected") &&
+                !CaseInsensitiveContains(output, "Disconnected")) return true;
+            if (CaseInsensitiveContains(output, "Registration Missing")) {
+                Log("[!] WARP needs registration. Register in the Cloudflare WARP app, then connect.");
+                return false;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    Log("[!] WARP did not reconnect. Check its status in the Cloudflare WARP app.");
+    return false;
+#else
     return true;
+#endif
 #endif
 }
 

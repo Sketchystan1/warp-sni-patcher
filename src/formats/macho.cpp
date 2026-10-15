@@ -688,8 +688,8 @@ Inspection summary(const std::vector<Slice> &ss) {
         i.architectures.push_back(s.arch());
     i.notes = {
         "Verified chained pointers and x86_64/arm64 compiler layouts from WARP 2026.8.2110.0.",
-        "Modified executables require macOS signing and invalidate their enclosing app's vendor seal. "
-        "PacketTunnel certificate requirements remain incompatible with ad-hoc signing.",
+        "On macOS the patched daemon receives an ad-hoc signature, replacing Cloudflare's signing identity. "
+        "Use the in-daemon tunnel; PacketTunnel's vendor certificate requirement is incompatible.",
         "Registration replacements over 25 bytes must match an existing devices/federal endpoint."};
     return i;
 }

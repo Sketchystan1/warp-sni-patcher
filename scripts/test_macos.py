@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -49,6 +50,8 @@ def connected(phase):
     status = ""
     while time.monotonic() < deadline:
         status = cli("status", check=False, timeout=5).stdout
+        if "Registration Missing" in status:
+            raise RuntimeError(f"{phase}: {status.strip()}")
         if "Connected" in status and "Disconnected" not in status:
             trace = run("curl", "--silent", "--show-error", "--max-time", "10",
                         "https://www.cloudflare.com/cdn-cgi/trace", check=False, timeout=15)
@@ -62,14 +65,19 @@ def connected(phase):
 def registration_diagnostics():
     # Report known error markers only, never registration records, tokens or IPs.
     print("Console user: " + run("stat", "-f", "%Su", "/dev/console").stdout.strip(), flush=True)
-    logs = run("sudo", "tail", "-n", "2000",
-               "/Library/Application Support/Cloudflare/warp-svc.log", check=False).stdout
+    logs = ""
+    for path in Path("/Library/Application Support/Cloudflare").glob("cfwarp_service_log*"):
+        logs += run("sudo", "tail", "-n", "2000", path, check=False).stdout
     for marker in ("Failed to load Registration", "Error reading reg cache file",
                    "Failed to store active registration to cache", "Failed to open key for mTLS",
                    "Failed to get certificate from identity", "Keychain not found",
-                   "unable to determine the last active user", "Local config file missing or corrupted"):
-        if marker in logs:
-            print("Daemon diagnostic: " + marker, flush=True)
+                   "unable to determine the last active user", "Local config file missing or corrupted",
+                   "Invalidating cached registration", "registration to cache"):
+        for line in logs.splitlines():
+            if marker in line:
+                # Disposable test-account logs only; remove identifiers and credential-shaped values.
+                line = re.sub(r"https?://\S+|[A-Za-z0-9_+/=-]{24,}", "[redacted]", line)
+                print("Daemon diagnostic: " + line[line.index(marker):][:500], flush=True)
 
 
 def signature():
@@ -104,7 +112,6 @@ def main():
         wait_ready()
         connected("Original after restart")
         cli("disconnect")
-        cli("registration", "delete")
         run("sudo", PATCHER, "patch", timeout=120, show=True)
         if digest(backup) != original or digest(DAEMON) == original:
             raise RuntimeError("Patch or original backup is incorrect")
@@ -112,6 +119,9 @@ def main():
         if "Signature=adhoc" not in signed or "TeamIdentifier=not set" not in signed:
             raise RuntimeError("Expected an ad-hoc signature without Cloudflare's signing identity")
         wait_ready()
+        connected("Patched with existing registration")
+        cli("disconnect")
+        cli("registration", "delete")
         cli("registration", "new", timeout=90)
         connected("Patched")
         run("sudo", PATCHER, "restore", timeout=120, show=True)

@@ -86,8 +86,8 @@ def build_macos(jobs):
     CACHE.mkdir(exist_ok=True)
     source = capstone_source(CACHE)
     decoder = CACHE / "capstone-universal"
-    architectures = "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
-    configure(decoder, architectures, "-DCAPSTONE_BUILD_MACOS_THIN=ON",
+    toolchain = ["-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64", "-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0"]
+    configure(decoder, *toolchain, "-DCAPSTONE_BUILD_MACOS_THIN=ON",
               "-DCAPSTONE_ARCHITECTURE_DEFAULT=OFF", "-DCAPSTONE_ARM64_SUPPORT=ON",
               "-DCAPSTONE_X86_SUPPORT=ON", "-DCAPSTONE_BUILD_DIET=ON",
               "-DBUILD_SHARED_LIBS=OFF", "-DBUILD_STATIC_LIBS=ON",
@@ -95,7 +95,7 @@ def build_macos(jobs):
               "-DCAPSTONE_BUILD_CSTEST=OFF", "-DCAPSTONE_INSTALL=OFF", source=source)
     run("cmake", "--build", decoder, "--target", "capstone_static", "--parallel", jobs)
     app = CACHE / "native"
-    configure(app, architectures, f"-DWARP_CAPSTONE_INCLUDE_DIR={source / 'include'}",
+    configure(app, *toolchain, f"-DWARP_CAPSTONE_INCLUDE_DIR={source / 'include'}",
               f"-DWARP_CAPSTONE_LIBRARY={decoder / 'libcapstone.a'}")
     build(app, jobs)
     run("lipo", app / "warp-sni-patcher", "-verify_arch", "x86_64", "arm64")

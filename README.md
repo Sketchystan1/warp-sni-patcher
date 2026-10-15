@@ -12,7 +12,7 @@ Modifying installed WARP requires administrator/root privileges. For CLI options
 
 Patching invalidates WARP's signature; updates may undo patches. Releases have no trusted publisher signature.
 
-The macOS patcher does not re-sign the daemon; working tunnel operation is unverified. Bundled dependency notices are available with `--licenses`.
+macOS re-signs the patched daemon ad hoc, replacing Cloudflare's signing identity; Restore recovers the original signature. It requires the in-daemon tunnel (WARP's default); PacketTunnel mode is unsupported. Bundled dependency notices are available with `--licenses`.
 
 ## Build
 
@@ -28,4 +28,4 @@ After a successful build, `build/` contains only the Windows ZIP, Linux TAR.GZ, 
 
 One GitHub workflow builds and tests all platforms. Push a new [changelog](CHANGELOG.md) version to `master`/`main`, push its matching version tag, or run the workflow manually to publish. Pull requests only build and test.
 
-Each release includes three platform packages, with notes from the changelog. GitHub displays their SHA-256 hashes and adds source archives. The CI macOS package targets the runner's architecture; `build.bat` produces a universal Intel/ARM64 package.
+Each release includes three platform packages, with notes from the changelog. GitHub displays their SHA-256 hashes and adds source archives. The macOS ZIP supports Intel and Apple silicon; Actions tests both against WARP 2026.8.2110.0.
