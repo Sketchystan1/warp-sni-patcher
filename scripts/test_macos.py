@@ -59,6 +59,19 @@ def connected(phase):
     raise RuntimeError(f"{phase}: tunnel did not carry HTTPS traffic; {status.strip()}")
 
 
+def registration_diagnostics():
+    # Report known error markers only, never registration records, tokens or IPs.
+    print("Console user: " + run("stat", "-f", "%Su", "/dev/console").stdout.strip(), flush=True)
+    logs = run("sudo", "tail", "-n", "2000",
+               "/Library/Application Support/Cloudflare/warp-svc.log", check=False).stdout
+    for marker in ("Failed to load Registration", "Error reading reg cache file",
+                   "Failed to store active registration to cache", "Failed to open key for mTLS",
+                   "Failed to get certificate from identity", "Keychain not found",
+                   "unable to determine the last active user", "Local config file missing or corrupted"):
+        if marker in logs:
+            print("Daemon diagnostic: " + marker, flush=True)
+
+
 def signature():
     run("codesign", "--verify", "--strict", "--all-architectures", DAEMON)
     return run("codesign", "--display", "--verbose=4", DAEMON).stderr
@@ -86,6 +99,10 @@ def main():
         cli("registration", "new", timeout=90)
         cli("tunnel", "protocol", "set", "MASQUE")
         connected("Original")
+        run("sudo", "launchctl", "kickstart", "-k",
+            "system/com.cloudflare.1dot1dot1dot1.macos.warp.daemon")
+        wait_ready()
+        connected("Original after restart")
         cli("disconnect")
         cli("registration", "delete")
         run("sudo", PATCHER, "patch", timeout=120, show=True)
@@ -104,6 +121,9 @@ def main():
             raise RuntimeError("Restore did not recover Cloudflare's signature")
         connected("Restored")
         print("PASS: registration, MASQUE tunnel, ad-hoc signing, and exact signed restore", flush=True)
+    except Exception:
+        registration_diagnostics()
+        raise
     finally:
         cli("disconnect", check=False)
         if backup.exists():

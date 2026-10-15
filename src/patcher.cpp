@@ -167,9 +167,11 @@ static void ReplaceFile(const std::string& target, const std::string& source, co
 #ifdef __APPLE__
             // An ad-hoc daemon has no vendor Team ID. Preserve its identifier, but
             // not hardened-runtime library validation tied to the vendor identity.
-            Codesign({"codesign", "--force", "--sign", "-", "--options", "0",
-                      "--preserve-metadata=identifier", "--timestamp=none", tmp.c_str()});
-            Codesign({"codesign", "--verify", "--strict", "--all-architectures", tmp.c_str()});
+            if (is_macho(*bytes)) {
+                Codesign({"codesign", "--force", "--sign", "-", "--options", "0",
+                          "--preserve-metadata=identifier", "--timestamp=none", tmp.c_str()});
+                Codesign({"codesign", "--verify", "--strict", "--all-architectures", tmp.c_str()});
+            }
 #endif
         }
 #ifdef _WIN32
