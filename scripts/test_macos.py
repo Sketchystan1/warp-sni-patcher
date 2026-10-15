@@ -110,6 +110,7 @@ def main():
     if sys.platform != "darwin" or os.environ.get("GITHUB_ACTIONS") != "true":
         raise RuntimeError("This destructive integration test requires a disposable macOS Actions runner")
     print(f"Testing WARP {VERSION} on macOS {platform.mac_ver()[0]} {platform.machine()}", flush=True)
+    run("/usr/bin/csrutil", "status", show=True)
     archives = list(Path(".cache/native").glob("warp-sni-patcher-*-macos.zip"))
     if len(archives) != 1:
         raise RuntimeError("Expected exactly one macOS package")
