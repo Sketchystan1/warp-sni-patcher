@@ -12,7 +12,7 @@ Modifying installed WARP requires administrator/root privileges. For CLI options
 
 Patching invalidates WARP's signature; updates may undo patches. Releases have no trusted publisher signature.
 
-macOS re-signs the patched daemon ad hoc, replacing Cloudflare's signing identity; Restore recovers the original signature. It requires the in-daemon tunnel (WARP's default); PacketTunnel mode is unsupported. Bundled dependency notices are available with `--licenses`.
+On macOS, run `warp-cli registration delete` **before Patch or Restore**, then register again afterward (`warp-cli registration new` for personal WARP; sign in again for Zero Trust). This resets device registration because ad-hoc signing changes Keychain access. Restore recovers Cloudflare's original signature. PacketTunnel mode is unsupported; use WARP's default in-daemon tunnel. Dependency notices: `--licenses`.
 
 ## Build
 

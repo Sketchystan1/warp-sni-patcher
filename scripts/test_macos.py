@@ -86,12 +86,20 @@ def signature():
     return run("codesign", "--display", "--verbose=4", DAEMON).stderr
 
 
-def register_after_signing(phase):
-    status = cli("status").stdout
-    if "Registration Missing" in status:
-        print(f"{phase}: signing identity changed; resetting the disposable test registration", flush=True)
-        cli("registration", "delete", show=True)
-        cli("registration", "new", timeout=90)
+def signing_guard(action):
+    before = digest(DAEMON)
+    result = run("sudo", PATCHER, action, timeout=120, check=False)
+    if result.returncode != 1 or "Remove WARP registration before" not in result.stdout:
+        raise RuntimeError(f"{action} did not protect the existing registration")
+    if digest(DAEMON) != before or "Connected" not in cli("status").stdout:
+        raise RuntimeError("Signing guard modified the daemon or interrupted its connection")
+    print(f"{action}: existing registration and connection preserved by signing guard", flush=True)
+
+
+def restart():
+    run("sudo", "launchctl", "kickstart", "-k",
+        "system/com.cloudflare.1dot1dot1dot1.macos.warp.daemon")
+    wait_ready()
 
 
 def digest(path):
@@ -128,11 +136,11 @@ def main():
         cli("registration", "new", timeout=90)
         cli("tunnel", "protocol", "set", "MASQUE")
         connected("Original")
-        run("sudo", "launchctl", "kickstart", "-k",
-            "system/com.cloudflare.1dot1dot1dot1.macos.warp.daemon")
-        wait_ready()
+        restart()
         connected("Original after restart")
+        signing_guard("patch")
         cli("disconnect")
+        cli("registration", "delete")
         run("sudo", PATCHER, "patch", timeout=120, show=True)
         if digest(backup) != original or digest(DAEMON) == original:
             raise RuntimeError("Patch or original backup is incorrect")
@@ -140,16 +148,19 @@ def main():
         if "Signature=adhoc" not in signed or "TeamIdentifier=not set" not in signed:
             raise RuntimeError("Expected an ad-hoc signature without Cloudflare's signing identity")
         wait_ready()
-        register_after_signing("Patched")
+        cli("registration", "new", timeout=90)
         connected("Patched")
-        restored = run("sudo", PATCHER, "restore", timeout=120, show=True, check=False)
-        if restored.returncode and ("WARP needs registration" not in restored.stdout or "Done!" in restored.stdout):
-            raise RuntimeError("Restore failed without an actionable registration message")
+        restart()
+        connected("Patched after restart")
+        signing_guard("restore")
+        cli("disconnect")
+        cli("registration", "delete")
+        run("sudo", PATCHER, "restore", timeout=120, show=True)
         if digest(DAEMON) != original or backup.exists():
             raise RuntimeError("Restore did not recover the exact original daemon")
         if "TeamIdentifier=68WVV388M8" not in signature():
             raise RuntimeError("Restore did not recover Cloudflare's signature")
-        register_after_signing("Restored")
+        cli("registration", "new", timeout=90)
         connected("Restored")
         print("PASS: registration, MASQUE tunnel, ad-hoc signing, and exact signed restore", flush=True)
     except Exception:
@@ -157,9 +168,9 @@ def main():
         raise
     finally:
         cli("disconnect", check=False)
+        cli("registration", "delete", check=False)
         if backup.exists():
             run("sudo", PATCHER, "restore", timeout=120, show=True, check=False)
-        cli("registration", "delete", check=False)
 
 
 if __name__ == "__main__":

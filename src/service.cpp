@@ -613,6 +613,16 @@ static bool IsServiceRunningMac() {
     return RunPosixCommand("/usr/bin/pgrep -x CloudflareWARP");
 }
 
+static bool CanChangeSigningIdentityMac(const std::string& target) {
+    const auto cli = FindWarpCliPath(target);
+    if (!cli.empty() && RunPosixCommand("\"" + cli + "\" registration show")) {
+        Log("[!] Remove WARP registration before Patch or Restore: warp-cli registration delete");
+        Log("This resets the device registration. Afterward, register again (personal WARP: warp-cli registration new).");
+        return false;
+    }
+    return true;
+}
+
 static bool StopServiceMac() {
     Log("Stop service...");
     if (IsServiceLoadedMac() &&
@@ -692,6 +702,11 @@ bool RunOperation(const PatchOptions& options, bool restore) {
         return false;
     }
     const bool installed = IsInstalledTarget(options.target_path);
+#ifdef __APPLE__
+    // Keychain credentials belong to their creating signature. Never strand an
+    // existing registration under a different identity or silently delete it.
+    if (installed && !CanChangeSigningIdentityMac(options.target_path)) return false;
+#endif
     bool was_running = false, was_connected = false;
     if (installed) {
         if (!WarpDisconnectIfConnected(options.target_path, &was_connected)) return false;

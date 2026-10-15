@@ -2,7 +2,7 @@ name: Build, test, and release
 
 on:
   push:
-    branches: [master, main, 'codex/macos-runtime-validation']
+    branches: ['**']
     tags: ['v*']
   pull_request:
     branches: [master, main]
